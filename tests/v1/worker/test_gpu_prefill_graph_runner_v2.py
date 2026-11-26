@@ -278,6 +278,23 @@ def test_install_is_local_idempotent_and_before_binding(runner: SimpleNamespace)
     assert native.CudaGraphManager.dispatch is original_dispatch
 
 
+@pytest.mark.l1  # type: ignore[misc]
+@pytest.mark.parametrize(  # type: ignore[misc]
+    "mode,piecewise",
+    [(Mode.FULL_AND_PIECEWISE, True), (Mode.FULL_DECODE_ONLY, False)],
+)
+def test_grouped_cache_uses_native_mixed_prefill_capability(
+    runner: SimpleNamespace, mode: Mode, piecewise: bool
+) -> None:
+    runner.model_config.is_hybrid = True
+    runner.cudagraph_manager.cudagraph_mode = mode
+    pg2.install_prefill_graph_manager_v2(runner)
+    manager = runner.cudagraph_manager
+    assert isinstance(manager, pg2.GRPrefillCudaGraphManager)
+    assert not manager.plan.full
+    assert manager.plan.piecewise is piecewise
+
+
 @pytest.mark.parametrize(  # type: ignore[misc]
     "gate", ["env", "eager", "none", "tp", "dp", "pp", "ubatch", "lora", "spec", "aux", "mm"]
 )

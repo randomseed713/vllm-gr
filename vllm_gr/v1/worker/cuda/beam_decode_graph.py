@@ -61,6 +61,8 @@ class BeamDecodeGraph:
         self.capture_inputs: Any = None
         self.capture_attention: Any = None
         self._bindings: dict[BeamDecodeGraphSignature, tuple[Any, Any, Any]] = {}
+        self.cache_group_inputs: dict[BeamDecodeGraphSignature, Any] = {}
+        self.refused_group_shapes: set[BeamDecodeGraphSignature] = set()
         self.capturing = False
         self.original_model = worker.model
         runnable = worker.model
@@ -101,6 +103,7 @@ class BeamDecodeGraph:
         """Drop a capture whose fixed input addresses cannot be reused."""
         self.wrapper.concrete_cudagraph_entries.pop(self.descriptor, None)
         self._bindings.pop(self.signature, None)
+        self.cache_group_inputs.pop(self.signature, None)
         self.capture_inputs = self.capture_attention = None
         self.worker._beam_graph_keys = {signature.num_model_rows for signature in self._bindings}
 
@@ -133,6 +136,8 @@ class BeamDecodeGraph:
         self._registries.clear()
         self.wrapper.clear_graphs()
         self._bindings.clear()
+        self.cache_group_inputs.clear()
+        self.refused_group_shapes.clear()
         self.capture_inputs = self.capture_attention = None
         self.worker._beam_graph_keys = set()
 
@@ -222,6 +227,9 @@ class BeamDecodeGraph:
         entry = self.wrapper.concrete_cudagraph_entries[self.descriptor]
         assert entry.cudagraph is not None
         entry.cudagraph.replay()
+        self.worker._beam_graph_full_dispatch_count = (
+            getattr(self.worker, "_beam_graph_full_dispatch_count", 0) + 1
+        )
         return cast(torch.Tensor, entry.output)
 
     def model_forward(self, *args: Any, **kwargs: Any) -> Any:

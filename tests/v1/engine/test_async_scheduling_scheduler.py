@@ -22,17 +22,20 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from tests.helpers.beam_requests import make_batch_request
+from tests.helpers.beam_requests import make_batch_request, make_multi_batch_request
 from vllm_gr.v1.beam.batch_contracts import (
     BeamBatchOutput,
+    BeamBatchRequest,
     BeamBatchResult,
     BeamOutputSequence,
     BeamRequestOutput,
+    GRAdmissionError,
 )
 from vllm_gr.v1.beam.dispatch import (
     GR_RETIRE_OUTPUT_ATTR,
@@ -152,10 +155,13 @@ def add(scheduler, name, prompt=7, n=3):
 
 def receipt(scheduled, *, finished=None, released=None):
     mapping = getattr(scheduled, GR_STAGE_OUTPUT_ATTR, {})
-    ids, sampled, results = [], [], {}
+    ids: list[str] = []
+    sampled: list[list[int]] = []
+    results = {}
     for name, m in mapping.items():
-        ids.append(name)
-        sampled.append([0] if m.produces_output else [])
+        members = m.request_ids or (name,)
+        ids.extend(members)
+        sampled.extend([0] if m.produces_output else [] for _ in members)
         worker_finished = m.is_last_stage if finished is None else finished
         resources_released = (
             bool(worker_finished and m.is_last_stage) if released is None else released
@@ -452,6 +458,141 @@ def test_prefix_cache_hit_reuses_only_full_prompt_blocks(scheduler):
     m = getattr(output, GR_STAGE_OUTPUT_ATTR)["B"]
     assert m.produces_output and m.stage_index == 0
     assert len(scheduler.kv_cache_manager.get_blocks("B").blocks[0]) == 3
+
+
+def _make_hybrid_scheduler(
+    scheduler: AsyncScheduler,
+    *,
+    hash_block_size: int,
+    internal_checkpoint: bool,
+    num_blocks: int = 40,
+) -> AsyncScheduler:
+    config = scheduler.vllm_config
+    config.model_config._model_info = replace(config.model_config._model_info, is_hybrid=True)
+    config.cache_config.mamba_cache_mode = "align"
+    config.cache_config.prefix_match_unit = hash_block_size
+    config.scheduler_config.enable_chunked_prefill = True
+    config.scheduler_config.max_num_seqs = 8
+    kv = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            *scheduler.kv_cache_config.kv_cache_groups,
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=16,
+                    shapes=((1024,),),
+                    dtypes=(torch.float16,),
+                    mamba_cache_mode="align",
+                    num_prefill_checkpoint_blocks=int(internal_checkpoint),
+                    prefill_checkpoint_alignment=16,
+                ),
+            ),
+        ],
+    )
+    config.cache_config.num_gpu_blocks = kv.num_blocks
+    hybrid = AsyncScheduler(
+        config,
+        kv,
+        scheduler.structured_output_manager,
+        block_size=16,
+        hash_block_size=hash_block_size,
+    )
+    assert hybrid.mamba_has_prefill_checkpoint_blocks == internal_checkpoint
+    assert hybrid.mamba_partial_cache_hit == (hash_block_size < 16)
+    assert hybrid.need_mamba_block_aligned_split
+    return hybrid
+
+
+def _make_hybrid_requests(
+    prompt_tokens: int, hash_block_size: int
+) -> tuple[BeamBatchRequest, list[Request]]:
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core import kv_cache_utils
+
+    if not hasattr(kv_cache_utils, "NONE_HASH"):
+        kv_cache_utils.init_none_hash(sha256)
+    hasher = kv_cache_utils.get_request_block_hasher(hash_block_size, sha256)
+    batch = make_multi_batch_request()
+    requests: list[Request] = []
+    for item in batch.items:
+        item.request.prompt_token_ids = np.full(prompt_tokens, 1, dtype=np.int64)
+        native = Request.from_engine_core_request(item.request, block_hasher=hasher)
+        native.gr_batch_request = batch
+        requests.append(native)
+    return batch, requests
+
+
+@pytest.mark.l2
+@pytest.mark.parametrize("scheduler", [True], indirect=True)
+@pytest.mark.parametrize(
+    ("prompt_tokens", "hash_block_size", "internal_checkpoint"),
+    [
+        pytest.param(24, 16, True, id="internal-checkpoint"),
+        pytest.param(31, 16, True, id="decode-crosses-block"),
+        pytest.param(12, 8, False, id="partial-tail-copy"),
+    ],
+)
+def test_grouped_mamba_prefill_uses_completed_prefixes(
+    scheduler, prompt_tokens, hash_block_size, internal_checkpoint
+):
+    hybrid = _make_hybrid_scheduler(
+        scheduler, hash_block_size=hash_block_size, internal_checkpoint=internal_checkpoint
+    )
+    batch, requests = _make_hybrid_requests(prompt_tokens, hash_block_size)
+    for request in requests:
+        hybrid.add_request(request)
+
+    if hybrid.mamba_partial_cache_hit:
+        checkpoint = hybrid.schedule()
+        assert checkpoint.num_scheduled_tokens == {batch.batch_id: hash_block_size}
+        hybrid.update_from_output(
+            checkpoint,
+            ModelRunnerOutput(
+                req_ids=[batch.batch_id],
+                req_id_to_index={batch.batch_id: 0},
+                sampled_token_ids=[[]],
+            ),
+        )
+
+    for _ in batch.items:
+        assert hybrid.schedule().total_num_scheduled_tokens == 0
+    prefill = hybrid.schedule()
+    warm_tokens = hash_block_size if hybrid.mamba_partial_cache_hit else 0
+    assert prefill.num_scheduled_tokens == {
+        item.request.request_id: prompt_tokens - warm_tokens for item in batch.items
+    }
+    assert prefill.gr_stage_metadata[batch.batch_id].stage_index == 0
+    manager = hybrid.kv_cache_manager
+    _, cached_tokens, _ = manager.get_computed_blocks(hybrid.requests[batch.batch_id])
+    assert cached_tokens == hash_block_size
+    if hybrid.mamba_partial_cache_hit:
+        first, second = batch.items
+        (source,) = manager.get_blocks(first.request.request_id).blocks[1]
+        (target,) = manager.get_blocks(second.request.request_id).blocks[1]
+        assert (source.block_id, target.block_id) in prefill.kv_cache_block_copies
+
+    stage = prefill
+    for stage_index in range(1, batch.beam_params.max_tokens):
+        hybrid.update_from_output(stage, receipt(stage))
+        stage = hybrid.schedule()
+        assert stage.num_scheduled_tokens == {
+            request_id: 1 for request_id in prefill.num_scheduled_tokens
+        }
+        assert stage.gr_stage_metadata[batch.batch_id].stage_index == stage_index
+
+
+@pytest.mark.l2
+@pytest.mark.parametrize("scheduler", [True], indirect=True)
+def test_hybrid_decode_tail_copy_rejects_insufficient_capacity(scheduler):
+    hybrid = _make_hybrid_scheduler(
+        scheduler, hash_block_size=8, internal_checkpoint=False, num_blocks=21
+    )
+    _, requests = _make_hybrid_requests(prompt_tokens=8, hash_block_size=8)
+    with pytest.raises(GRAdmissionError, match="exceeds the total native KV capacity"):
+        hybrid.add_request(requests[0])
+    assert not hybrid.has_requests()
 
 
 @pytest.mark.parametrize("n", [1, 2, 3])

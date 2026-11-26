@@ -89,6 +89,177 @@ then regenerate `constraint_triples.json` from that catalog. Pass the new
 triples file to the constrained command.
 The same guide shows how to compile a persistent table for online serving.
 
+## Run Hybrid Beam on CUDA
+
+`GRLLM.beam_search()` supports Hybrid decoders with eligible recurrent and
+paged attention cache groups on CUDA ModelRunner V1 and V2. Use a native
+attention backend and an unquantized KV cache. The validation model is
+[Ling-3.0-tiny](https://huggingface.co/inclusionAI/Ling-3.0-tiny),
+which combines Kimi Delta Attention (KDA) and Multi-Head Latent Attention (MLA).
+See the [cache and graph requirements](../../../docs/design/feature/beam_batch_execution.md#hybrid-cuda-decode).
+
+For prefix caching, use `mamba_cache_mode="align"` and enable chunked Prefill.
+With prefix caching disabled, use `mamba_cache_mode="none"` and disable
+chunked Prefill. The example selects `TRITON_MLA` for Decode graph replay.
+Set `enforce_eager=True` for eager execution.
+
+Set `max_num_seqs` and `max_num_batched_tokens` to cover both the startup beam
+width and the number of prompts times the largest Decode input width. The
+sequence budget must cover the prompt count, and the token budget must cover
+the sum of the prompt lengths. See the
+[batch and token budgets](../../../docs/configuration/README.md#batch-sizes-and-token-budgets).
+
+For recommendation, use a checkpoint trained on your SID tokens. Set
+`HYBRID_MODEL` to the trusted local checkpoint path, `SID_TRIPLES` to a
+[versioned triples JSON file](../../../docs/configuration/constraint_tables.md#build),
+and `SID_PROMPT` to a UTF-8 prompt file. Each entry under `triples` uses
+`a`, `b`, and `c` keys with values from the checkpoint's tokenizer.
+
+Save the following as `hybrid_beam.py` and run it with
+`VLLM_USE_V2_MODEL_RUNNER=1 python hybrid_beam.py`. Set
+`VLLM_USE_V2_MODEL_RUNNER=0` to select V1.
+
+```python
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from vllm_gr.constraints.artifact_builder import build_single_trie_artifact
+from vllm_gr.entrypoints.gr import GRLLM
+from vllm_gr.sampling_params import BeamSearchParams
+
+
+def main():
+    model = Path(os.environ["HYBRID_MODEL"]).resolve()
+    catalog = Path(os.environ["SID_TRIPLES"])
+    prompt = Path(os.environ["SID_PROMPT"]).read_text(encoding="utf-8")
+    width = 8
+    with TemporaryDirectory() as directory:
+        artifact = Path(directory) / "table.safetensors"
+        artifact_digest, tokenizer_digest = build_single_trie_artifact(model, catalog, artifact)
+        with GRLLM(
+            model=str(model),
+            trust_remote_code=True,
+            dtype="bfloat16",
+            attention_config={"backend": "TRITON_MLA"},
+            enforce_eager=False,
+            async_scheduling=True,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            mamba_cache_mode="align",
+            max_model_len=2048,
+            max_num_batched_tokens=4096,
+            max_num_seqs=2 * width,
+            gpu_memory_utilization=0.65,
+            compilation_config={
+                "cudagraph_mode": "FULL_AND_PIECEWISE",
+                "cudagraph_capture_sizes": [4, 32, 128, 512, 1024, 2048, 4096],
+            },
+            gr={
+                "beam_batch_sizes": [1, 2],
+                "prefill_token_buckets": [32, 128, 512, 1024, 2048, 4096],
+                "beam_width": [width] * 3,
+                "candidate_width": [width] * 3,
+                "max_decode_steps": 3,
+                "constraint_mode": "table",
+                "constraint_table": {
+                    "format": "constraint_table_v1",
+                    "path": str(artifact),
+                    "backend": "cuda",
+                    "max_top_k": width,
+                    "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
+                },
+            },
+        ) as llm:
+            results = llm.beam_search(
+                [{"prompt": prompt}, {"prompt": prompt}],
+                BeamSearchParams(
+                    beam_width=width,
+                    dynamic_beam_widths=[4, 6, 3],
+                    per_parent_beam_widths=[4, 3, 2],
+                    result_width=2,
+                    max_tokens=3,
+                    ignore_eos=True,
+                ),
+                output_mode="compact",
+            )
+            for request, result in enumerate(results):
+                for beam in result.sequences:
+                    print(request, beam.token_ids, beam.cumulative_logprob)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Beam requires TP, PP, DP, DCP and PCP sizes of 1. The BF16 Ling example
+runs on one NVIDIA L20 with resident weights. `FULL_AND_PIECEWISE` uses
+PIECEWISE Prefill and FULL Decode for the example's cache groups. Use
+`FULL_DECODE_ONLY` to run Prefill eagerly while retaining Decode replay.
+
+If your checkpoint uses SID boundary tokens, supply `begin_token` and
+`end_token` in `BeamSearchParams`. With both markers, set `max_tokens=5` for
+three generated SID tokens and keep three entries in each width schedule.
+
+### Serve Hybrid Beam
+
+Build a persistent copy of the single-Trie table from the repository root.
+
+```bash
+python tools/constraints/build_constraint_table.py --model "$HYBRID_MODEL" \
+  --triples "$SID_TRIPLES" --output hybrid.safetensors --trust-remote-code
+```
+
+Save `hybrid.yaml` next to the artifact. Use the complete digests printed by
+the builder, including each `sha256:` prefix.
+
+```yaml
+trust-remote-code: true
+dtype: bfloat16
+attention-config:
+  backend: TRITON_MLA
+async-scheduling: true
+enable-prefix-caching: true
+enable-chunked-prefill: true
+mamba-cache-mode: align
+max-model-len: 2048
+max-num-batched-tokens: 4096
+max-num-seqs: 16
+gpu-memory-utilization: 0.65
+compilation-config:
+  cudagraph_mode: FULL_AND_PIECEWISE
+  cudagraph_capture_sizes: [4, 32, 128, 512, 1024, 2048, 4096]
+gr:
+  beam_graph_enabled: true
+  beam_batch_sizes: [1, 2]
+  prefill_token_buckets: [32, 128, 512, 1024, 2048, 4096]
+  beam_width: [8, 8, 8]
+  candidate_width: [8, 8, 8]
+  max_decode_steps: 3
+  constraint_mode: table
+  constraint_table:
+    format: constraint_table_v1
+    path: ./hybrid.safetensors
+    backend: cuda
+    max_top_k: 8
+    digests:
+      artifact: "<artifact_digest>"
+      tokenizer: "<tokenizer_digest>"
+```
+
+Enable [GR dispatch for the `vllm` CLI](../../../docs/cli/README.md#enable-gr-dispatch)
+in the active environment, then start the server.
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$HYBRID_MODEL" --gr --config hybrid.yaml
+```
+
+For [grouped HTTP completions](../../../docs/serving/completions.md#request),
+send a list of prompts with `use_beam_search=true` and `n=8`. Add `--grpc`
+to the server command for [gRPC token inputs](../../../docs/serving/grpc.md).
+See the [configuration reference](../../../docs/configuration/README.md) for
+YAML settings and CLI overrides.
+
 ## Beam Search V1
 
 EngineCore schedules Beam Search V1 asynchronously. The profiling and A/B
@@ -128,7 +299,7 @@ Both modes require:
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
 - Set the request `beam_width` to the maximum value in `gr.beam_width`.
 - Token/text prompts rather than embedding prompts.
-- No speculative decoding, LoRA, quantization, hybrid model, encoder-decoder
+- No speculative decoding, LoRA, quantization, encoder-decoder
   model, or multimodal model.
 
 For catalog-constrained generation, pass `--catalog`, set
@@ -179,7 +350,7 @@ belong to `offline_beam_search.py`. Library defaults can differ.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `beam_graph_enabled` | `true` on CUDA | On Ascend, `--execution graph` enables Beam graphs and `--execution eager` disables them. CUDA ignores this flag. |
+| `beam_graph_enabled` | `true` on CUDA | The CUDA Beam example sets the GR option to `true`. On Ascend, the script's `--execution` option selects `graph` or `eager`. |
 | `worker_decision` | `true` | The script enables Beam selection on the Worker. |
 | `beam_width` | `[128, 128, 128]` | `--beam-width` sets both the engine capacity and the request width. |
 | `max_decode_steps` | `3` | `--generated-steps` sets the effective token count. The three-layer Constraint Table requires `3`. |

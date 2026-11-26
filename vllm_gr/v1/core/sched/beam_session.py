@@ -22,6 +22,15 @@ from vllm_gr.v1.beam.dispatch import (
     GRStageMetadata,
 )
 
+HybridBlockTable = tuple[tuple[tuple[Any, ...], ...], ...]
+HybridPrefillDispatchId = tuple[str, int, int]
+
+
+def advance_gr_progress(scheduler: Any) -> int:
+    progress = getattr(scheduler, "_gr_progress", 0) + 1
+    scheduler._gr_progress = progress
+    return progress
+
 
 class GRSessionStatus(str, Enum):
     WAITING = "waiting"
@@ -57,6 +66,8 @@ class GRSessionState:
     owner_generation: int = 0
     retirement: GRRetireMetadata | None = None
     worker_resources_allocated: bool = False
+    hybrid_beam_block_counts: tuple[tuple[int, ...], ...] = ()
+    hybrid_decode_reserved_blocks: int = 0
     # EngineCore-private lifecycle state. These fields are excluded from the
     # constructor and never cross the Scheduler/Worker boundary.
     _next_dispatch_id: int = field(default=0, init=False, repr=False)
@@ -67,6 +78,16 @@ class GRSessionState:
     _pending_terminal_result: BeamBatchResult | None = field(default=None, init=False, repr=False)
     _terminal_emitted: bool = field(default=False, init=False, repr=False)
     _kv_dispatch_leases: dict[int, Any] = field(default_factory=dict, init=False, repr=False)
+    _hybrid_beam_blocks: HybridBlockTable = field(default=(), init=False, repr=False)
+    _hybrid_prompt_blocks: HybridBlockTable = field(default=(), init=False, repr=False)
+    _hybrid_prefill_ready: set[str] = field(default_factory=set, init=False, repr=False)
+    _hybrid_prefill_pinned: list[tuple[Any, ...]] = field(
+        default_factory=list, init=False, repr=False
+    )
+    _hybrid_prefill_dispatch: HybridPrefillDispatchId | None = field(
+        default=None, init=False, repr=False
+    )
+    _hybrid_prefill_leases: tuple[tuple[Any, ...], ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -108,6 +129,10 @@ class GRSessionState:
     @property
     def in_flight_stages(self) -> int:
         return len(self._in_flight_dispatches)
+
+    @property
+    def hybrid_prefill_dispatch(self) -> HybridPrefillDispatchId | None:
+        return self._hybrid_prefill_dispatch
 
     @property
     def latest_device_state(self) -> GRDeviceStateRef | None:

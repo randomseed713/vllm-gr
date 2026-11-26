@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 import msgspec
 import pytest
@@ -87,6 +88,21 @@ def test_decode_stage_validates_against_the_stage_zero_record() -> None:
     output = dispatch(decode)
     assert validate_dispatch(output, previous=first, session=session) == (decode,)
     assert validate_dispatch(output, previous=first) == (decode,)
+
+
+def test_hybrid_block_groups_stay_bound_to_the_session() -> None:
+    groups = (((1, 2), (3, 4)),)
+    prompt = (((5,), (6,)),)
+    first = replace(metadata(), hybrid_beam_blocks=groups, hybrid_prompt_blocks=prompt)
+    session = validate_dispatch_session(dispatch(first))
+    decode = replace(metadata(1), hybrid_beam_blocks=groups, hybrid_prompt_blocks=prompt)
+    assert validate_dispatch(dispatch(decode), previous=first, session=session) == (decode,)
+    with pytest.raises(ValueError, match="logical Beam batch identity changed"):
+        validate_dispatch_step(
+            dispatch(replace(decode, hybrid_beam_blocks=(groups[0][::-1],))), session
+        )
+    with pytest.raises(ValueError, match="distinct non-null private block IDs"):
+        validate_dispatch_session(dispatch(replace(first, hybrid_beam_blocks=(((1,), (1,)),))))
 
 
 def test_step_rejects_a_record_from_another_logical_batch() -> None:

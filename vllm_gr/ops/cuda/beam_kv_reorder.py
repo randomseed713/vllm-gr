@@ -2,11 +2,105 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Duplicate-safe, bit-exact all-layer CUDA KV gather/scatter primitives."""
 
+from collections import defaultdict
+from collections.abc import Iterable
+
 import torch
 import triton
 import triton.language as tl
 
 # mypy: disable-error-code="misc,no-untyped-def"
+
+
+@triton.jit
+def _fork_cache_blocks(
+    addresses,
+    blocks,
+    scratch,
+    rows,
+    stride,
+    elements,
+    TILE: tl.constexpr,
+    GATHER: tl.constexpr,
+):
+    layer, row = tl.program_id(0) // rows, tl.program_id(0) % rows
+    index = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    cache = tl.load(addresses + layer).to(tl.pointer_type(scratch.dtype.element_ty))
+    block = tl.load(blocks + row).to(tl.int64)
+    cache += block * stride + index
+    value = scratch + (layer.to(tl.int64) * rows + row) * elements + index
+    if GATHER:
+        tl.store(value, tl.load(cache, index < elements), index < elements)
+    else:
+        tl.store(cache, tl.load(value, index < elements), index < elements)
+
+
+def _dense_block_size(tensor: torch.Tensor) -> int:
+    # Native layer views can transpose the interior of a block and pad the
+    # stride between blocks. Vectorize only the bytes owned by this view.
+    size = 1
+    dims = sorted(zip(tensor.stride()[1:], tensor.shape[1:], strict=True))
+    for stride, extent in dims:
+        if extent > 1:
+            if stride != size:
+                return 0
+            size *= extent
+    return size if tensor.stride(0) >= size else 0
+
+
+class CacheBlockCopy:
+    """Two device launches per dense cache layout, with an exact strided fallback."""
+
+    def __init__(self, tensors: Iterable[torch.Tensor]) -> None:
+        self.tensors = tuple({tensor.data_ptr(): tensor for tensor in tensors}.values())
+        bins: dict[tuple[torch.dtype, int, int], list[torch.Tensor]] = defaultdict(list)
+        self.strided: list[torch.Tensor] = []
+        for tensor in self.tensors:
+            elements = _dense_block_size(tensor) if tensor.is_cuda else 0
+            if elements:
+                bins[tensor.dtype, tensor.stride(0), elements].append(tensor)
+            else:
+                self.strided.append(tensor)
+        self.layouts = [
+            (
+                torch.tensor(
+                    [tensor.data_ptr() for tensor in matching],
+                    dtype=torch.int64,
+                    pin_memory=True,
+                ).to(matching[0].device, non_blocking=True),
+                dtype,
+                stride,
+                elements,
+            )
+            for (dtype, stride, elements), matching in bins.items()
+        ]
+
+    def copy(self, source: torch.Tensor, destination: torch.Tensor) -> None:
+        rows = source.numel()
+        if rows == 0:
+            return
+        if self.layouts:
+            source, destination = source.contiguous(), destination.contiguous()
+        for addresses, dtype, stride, elements in self.layouts:
+            # Bound scratch for wide batches. Layer chunks can run separately,
+            # but splitting Beam rows would let an earlier chunk clobber a parent.
+            layer_bytes = rows * elements * dtype.itemsize
+            chunk = min(addresses.numel(), max(1, (32 << 20) // layer_bytes))
+            scratch = torch.empty((chunk, rows, elements), dtype=dtype, device=addresses.device)
+            for layers in addresses.split(chunk):
+                grid = (layers.numel() * rows, triton.cdiv(elements, 1024))
+                _fork_cache_blocks[grid](
+                    layers, source, scratch, rows, stride, elements, 1024, True
+                )
+                _fork_cache_blocks[grid](
+                    layers, destination, scratch, rows, stride, elements, 1024, False
+                )
+        for tensor in self.strided:
+            tensor.index_copy_(0, destination, tensor.index_select(0, source))
+
+    def clear(self, blocks: torch.Tensor) -> None:
+        for tensor in self.tensors:
+            tensor.index_fill_(0, blocks, 0)
 
 
 @triton.jit

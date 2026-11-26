@@ -77,6 +77,10 @@ Installer: `vllm_gr.engine.arg_utils.patch_create_engine_config`
 
 Risk: `high`; process roles: `main`, `api_server`
 
+Hybrid Beam startup checks the CUDA configuration, native cache mode and
+fixed beam width against the sequence and token budgets. Request admission
+checks the expanded Decode rows for each batch.
+
 ### GR-PATCH-007 — EngineCore Client and AsyncLLM Extensions
 
 Scope: `core`; backend ID: `null`
@@ -117,6 +121,16 @@ Installer: `vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch`
 
 Risk: `critical`; process roles: `engine_core`
 
+Hybrid Beam reserves native cache blocks per request and group, and leases
+the prompt and private blocks until the Worker release. In aligned mode
+the schedule wrapper scopes native Mamba checkpoint splitting to partial
+Prefill dispatches and keeps recurrent Decode capacity free through Prefill.
+It defers native `KVCacheCoordinator.cache_blocks` calls until all members of
+the final Prefill have been scheduled. When a running member can move a
+fine-grained prefix entry during allocation, `KVCacheManager.get_computed_blocks`
+returns the committed source captured at the start of the schedule. The
+update wrapper consumes native partial Prefill receipts.
+
 ### GR-PATCH-022 — Prefix-cache hash memoization
 
 Scope: `core`; backend ID: `null`
@@ -136,6 +150,13 @@ Owner: `vllm_gr/v1/worker/cuda/runner_installer.py, vllm_gr/v1/worker/cuda/v1/gp
 Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
 Risk: `critical`; process roles: `gpu_worker`
+
+The CUDA stages bind either the split suffix pool or native cache groups
+before the shared Decode graph dispatch. For native groups, both runners
+batch parent-state copies into private leased blocks and stage group metadata
+in the common graph registry. The V2 Prefill graph manager selects compatible
+plans for both layouts using the native mixed-mode capability for grouped
+caches.
 
 ### GR-PATCH-012 — NPU ModelRunner Override
 
