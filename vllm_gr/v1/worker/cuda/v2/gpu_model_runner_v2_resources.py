@@ -163,14 +163,17 @@ def capture_multibatch_forward(worker: Any, *, allow_eager_fallback: bool = True
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
     from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
     from vllm_gr.v1.worker.gr_context import _get_gr_config
-    from vllm_gr.v1.worker.gr_startup import _capture_batch, _capture_enabled
+    from vllm_gr.v1.worker.gr_startup import (
+        _capture_batch,
+        _capture_enabled,
+        decode_capture_batches,
+    )
 
     with torch.inference_mode():
         if not _capture_enabled(worker) or str(worker.device).split(":")[0] != "cuda":
             return False
         cfg = _get_gr_config(worker)
-        max_reqs = worker.vllm_config.scheduler_config.max_num_seqs
-        batches = tuple(b for b in cfg.deployment.beam_batch_sizes if b <= max_reqs)
+        batches = decode_capture_batches(worker)
         if not batches:
             return False
         runtime = get_v2_runtime(worker)

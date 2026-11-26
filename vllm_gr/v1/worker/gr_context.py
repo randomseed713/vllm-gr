@@ -7,6 +7,10 @@ from typing import Any
 from vllm_gr.config import GRConfig
 
 
+def is_hybrid_model(runner: Any) -> bool:
+    return bool(getattr(getattr(runner, "model_config", None), "is_hybrid", False))
+
+
 def _get_gr_config(runner: Any) -> GRConfig:
     return GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
 
@@ -131,6 +135,7 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
 
     model_config = runner.model_config
     parallel_config = runner.parallel_config
+    use_native_cache = is_hybrid_model(runner)
 
     return BeamAttentionContext(
         max_batch=max_batch,
@@ -142,6 +147,9 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
         device=runner.device,
         dtype=model_config.dtype,
         enable_short_suffix_attention=(
-            runner.device.type == "cuda" and gr_cfg.enable_short_suffix_attention
+            runner.device.type == "cuda"
+            and not use_native_cache
+            and gr_cfg.enable_short_suffix_attention
         ),
+        use_native_cache=use_native_cache,
     )

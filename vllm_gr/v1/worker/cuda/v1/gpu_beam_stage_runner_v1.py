@@ -8,15 +8,26 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.worker.cuda.beam_decode_graph import (
+    BeamDecodeCaptureUnsupported,
+    drain_failed_decode_capture,
+)
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
-    _hidden_logits,
+    capture_decode_forward,
+    decode_width,
+    replay_decode_forward,
     should_replay_decode_graph,
 )
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.cuda.gr_inputs import align_prefill_rows
+from vllm_gr.v1.worker.gr_context import is_hybrid_model
+
+logger = init_logger(__name__)
 
 
 class CudaStageHooksV1(CudaStageHooks):
@@ -63,7 +74,9 @@ class CudaStageHooksV1(CudaStageHooks):
         out = original(worker, scheduler_output, *args, **kwargs)
         if out is not None or worker.execute_model_state is None:
             raise RuntimeError("native GR Prefill must return logits through execute_model_state")
-        return worker.execute_model_state.logits
+        return align_prefill_rows(
+            scheduler_output, worker.input_batch.req_ids, worker.execute_model_state.logits
+        )
 
     def finish_native_output(self) -> None:
         """Drop native results after GR has submitted its output work."""
@@ -104,6 +117,8 @@ class CudaStageHooksV1(CudaStageHooks):
         return beam_width
 
     def prepare_new_adapter(self, view: BeamBatchExecutionView) -> None:
+        if is_hybrid_model(self.worker):
+            return
         graph = getattr(self.worker, "_beam_decode_graph", None)
         if graph is not None:
             graph.discard_geometry(view.batch_size, view.beam_width)
@@ -115,13 +130,13 @@ class CudaStageHooksV1(CudaStageHooks):
 
     def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
         """V1 can capture a missing graph against a new stage's buffers."""
-        assert owner.inputs is not None
         worker = self.worker
         from vllm_gr.v1.worker.gr_context import (
             _get_gr_config,
         )
 
         batch_size = len(owner.bindings)
+        width = decode_width(owner)
         cfg = _get_gr_config(worker)
         if batch_size not in cfg.deployment.beam_batch_sizes or batch_size in getattr(
             worker, "_gr_decode_capture_failures", {}
@@ -134,18 +149,31 @@ class CudaStageHooksV1(CudaStageHooks):
             and not getattr(worker, "_gr_async_decode_graph_capture_failed", False)
         )
         if graph_enabled:
-            graph = self.decode_graph(len(owner.bindings), owner.inputs.width)
+            graph = self.decode_graph(len(owner.bindings), width)
             bucket = getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0)
             if bucket:
-                graph.select(len(owner.bindings), owner.inputs.width, bucket)
+                graph.select(len(owner.bindings), width, bucket)
             if not graph.ready:
-                graph.capture(
-                    owner._forward_hidden,
-                    persistent_install=self.persistent_graph_install,
-                )
+                grouped = getattr(owner, "uses_native_cache", False)
+                if grouped and graph.signature in graph.refused_group_shapes:
+                    owner.graph = None
+                    return owner._forward()
+                try:
+                    capture_decode_forward(
+                        graph, owner, persistent_install=self.persistent_graph_install
+                    )
+                except BeamDecodeCaptureUnsupported as error:
+                    if not grouped:
+                        raise
+                    drain_failed_decode_capture(worker.device, error)
+                    graph.discard_selected()
+                    graph.refused_group_shapes.add(graph.signature)
+                    logger.warning("Decode graph refused for %s: %s", graph.signature, error)
+                    owner.graph = None
+                    return owner._forward()
             owner.graph = graph
         if should_replay_decode_graph(worker, owner.graph):
-            return _hidden_logits(owner, owner.graph.replay())
+            return replay_decode_forward(owner.graph, owner)
         # Eager Decode keeps the stage's ``_forward`` entry point; ``_forward``
         # publishes ``hidden`` itself when the LM head is sliced.
         return owner._forward()

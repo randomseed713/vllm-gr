@@ -59,6 +59,54 @@ position in the first allocation, and its limits apply to that whole extent.
 The worker uses parent indices to carry each survivor's history into the next
 step.
 
+### Hybrid CUDA Decode
+
+OneRec and Hybrid decoders join the same GR session, Prefill, Decode and
+candidate selection flow. OneRec uses one native prompt cache group with the
+GR split-attention suffix pool. Hybrid decoders bind native payloads for each
+group and use the group's attention or recurrent backend. Eligible native
+cache groups use unquantized device-resident storage and
+expose per-layer views. Recurrent groups use `MambaSpec` with zero speculative
+blocks and `none` or `align` caching. Attention groups use paged decoder
+self-attention with one token per cache state. See the
+[cache group validator](../../../vllm_gr/v1/beam/hybrid_cache.py) for the
+supported layouts.
+
+The scheduler budgets private blocks for each request and cache group alongside
+native Prefill and Decode allocations. Before each Prefill dispatch, it checks
+the full session budget against free blocks and distinct live blocks already
+held for the session. The whole batch waits when capacity falls short. The
+scheduler keeps the original prompt blocks and private blocks leased until the
+Worker has drained and released the session.
+
+With aligned recurrent prefix caching, native Prefill can schedule checkpoint
+chunks before the batch emits its first Beam token. Each partial dispatch uses
+native scheduling and output bookkeeping. The scheduler keeps the recurrent
+blocks needed by Decode available throughout Prefill. Once all prompts can
+finish, the scheduler dispatches their final chunks together and publishes
+new prefixes after all members have looked up existing prefixes. Fine-grained
+hits use the committed source from the start of the scheduling pass, so the
+Worker can copy each private tail before running the model. The Worker
+restores the logical request order before selecting candidates.
+
+Decode shares complete attention prompt pages. Each beam has private pages
+from the first writable position onward and one private state per recurrent
+group. GR uploads the leased block IDs once per session. The worker builds a
+device copy plan from request-local parent indices and batches dense block
+copies across requests and layers by layout. It gathers all sources before
+writing destinations so repeated parents and parent swaps preserve the
+previous state. Strided views use the same plan with tensor indexing.
+
+The GR Prefill stage can use native PIECEWISE graphs when the native mixed
+mode supports them. V2 uses the same GR token-bucket plan as OneRec to select
+a compatible Prefill graph. Model forward uses the shared GR Decode graph
+registry, startup capture and replay with fixed staging for group metadata.
+Full Decode graph bindings cover `GDN_ATTN` recurrent groups and `TRITON_MLA`
+attention groups. Each GDN capture owns its single-token query offsets and
+recurrent state indices. Other eligible cache groups use the eager Decode entry.
+Replay also requires `gr.beam_graph_enabled`, a configured batch shape and
+`enforce_eager=False`. Cache copies and Beam selection bracket the model graph.
+
 ### Validation boundaries
 
 | Boundary | Checks |
@@ -67,7 +115,7 @@ step.
 | Request form | Rejects `prompt_embeds`, `mm_features`, empty prompts and LoRA. Requires `ignore_eos=true`, `sampling_params.max_tokens` equal to `beam_params.max_tokens`, and `n=1`. EngineCore also clears native stop tokens. |
 | Engine capacity | Dispatch accepts one to eight prompts within native request, Prefill token, context and KV limits. The request beam width must equal the engine's fixed startup beam width. |
 | Dynamic widths | `dynamic_beam_widths` and `per_parent_beam_widths` must be tuples of length `max_tokens`; `max_tokens` must be 1 to 3 when either is set. Entries must be positive and at most the beam width, the first per-parent width must equal the first retained width, and each stage must satisfy `input_width * per_parent >= output_width`. |
-| Device and catalog | Ascend budgets Decode rows at the largest input width across Decode stages. Table-constrained requests must match the table depth and fit its candidate capacity. |
+| Device and catalog | Ascend and Hybrid CUDA budget Decode rows at the largest input width across stages. Hybrid CUDA also reserves private native cache blocks per request. Table-constrained requests must match the table depth and fit its candidate capacity. |
 | Output options | Candidate width counts expansions per parent. Retained width counts survivors per prompt. The final retained width bounds `num_return_sequences`. |
 
 Requests and results use wire protocol version 2. Multiprocess clients send
@@ -108,7 +156,9 @@ Prefill graph if its token bucket was captured. PIECEWISE uses the token
 bucket alone and can serve different admitted request counts.
 
 Size `max-num-seqs` for logical requests and `max-num-batched-tokens` for the
-Prefill workload and, on Ascend, the peak Decode row count. See the
+Prefill workload. Ascend also uses the token budget for peak Decode rows.
+Hybrid CUDA checks both budgets against its startup beam width and peak Decode
+rows. See the
 [batch and token budgets](../../configuration/README.md#batch-sizes-and-token-budgets)
 and [OneRec walkthrough](../../user_guide/onerec_quickstart.md).
 

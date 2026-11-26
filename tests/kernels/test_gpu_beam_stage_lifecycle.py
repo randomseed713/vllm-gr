@@ -214,6 +214,7 @@ def test_prefill_dma_drains_before_decode_bookkeeping(monkeypatch, dtype, prefix
     worker.prepare_inputs_event = InputPrepEvent()
     worker.synchronize_input_prep = MethodType(GPUModelRunner.synchronize_input_prep, worker)
     worker.input_batch = SimpleNamespace(
+        req_ids=["session-0"],
         req_id_to_index={"session-0": 0},
         num_computed_tokens_cpu_tensor=pinned,
         num_computed_tokens_cpu=pinned.numpy(),

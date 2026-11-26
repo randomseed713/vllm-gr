@@ -89,6 +89,39 @@ then regenerate `constraint_triples.json` from that catalog. Pass the new
 triples file to the constrained command.
 The same guide shows how to compile a persistent table for online serving.
 
+## Run Hybrid Beam on CUDA
+
+Use the [GRLLM entrypoint](#public-entrypoint) with a CUDA decoder that has
+eligible paged attention and recurrent cache groups. For the BF16
+[Ling-3.0-tiny](https://huggingface.co/inclusionAI/Ling-3.0-tiny) checkpoint,
+pass these options to `GRLLM`.
+
+```python
+hybrid_options = {
+    "trust_remote_code": True,
+    "attention_config": {"backend": "TRITON_MLA"},
+    "async_scheduling": True,
+    "enable_prefix_caching": True,
+    "enable_chunked_prefill": True,
+    "mamba_cache_mode": "align",
+    "max_model_len": 2048,
+    "max_num_batched_tokens": 4096,
+    "max_num_seqs": 16,
+}
+```
+
+For a batch of up to two prompts at Beam width 8, set `gr.beam_width` to
+`[8, 8, 8]`, the request's `beam_width` to `8`, and `gr.beam_batch_sizes` to
+`[1, 2]`. Use `FULL_AND_PIECEWISE` for PIECEWISE Prefill and FULL Decode, or set
+`enforce_eager=True` for eager execution. Run on a single rank with an
+unquantized KV cache. With prefix caching disabled, also disable chunked
+Prefill and use `mamba_cache_mode="none"`.
+
+A constraint table must use the checkpoint's tokenizer and SID catalog.
+Use `GRLLM.beam_search()` for offline requests, or apply the same model
+options to [grouped HTTP serving](../../../docs/serving/completions.md#request).
+See the [cache and graph requirements](../../../docs/design/feature/beam_batch_execution.md#hybrid-cuda-decode).
+
 ## Beam Search V1
 
 EngineCore schedules Beam Search V1 asynchronously. The profiling and A/B
@@ -128,7 +161,7 @@ Both modes require:
 - TP, PP, DP, DCP, and PCP sizes equal to 1.
 - Set the request `beam_width` to the maximum value in `gr.beam_width`.
 - Token/text prompts rather than embedding prompts.
-- No speculative decoding, LoRA, quantization, hybrid model, encoder-decoder
+- No speculative decoding, LoRA, quantization, encoder-decoder
   model, or multimodal model.
 
 For catalog-constrained generation, pass `--catalog`, set
@@ -179,7 +212,7 @@ belong to `offline_beam_search.py`. Library defaults can differ.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `beam_graph_enabled` | `true` on CUDA | On Ascend, `--execution graph` enables Beam graphs and `--execution eager` disables them. CUDA ignores this flag. |
+| `beam_graph_enabled` | `true` on CUDA | The CUDA Beam example sets the GR option to `true`. On Ascend, the script's `--execution` option selects `graph` or `eager`. |
 | `worker_decision` | `true` | The script enables Beam selection on the Worker. |
 | `beam_width` | `[128, 128, 128]` | `--beam-width` sets both the engine capacity and the request width. |
 | `max_decode_steps` | `3` | `--generated-steps` sets the effective token count. The three-layer Constraint Table requires `3`. |

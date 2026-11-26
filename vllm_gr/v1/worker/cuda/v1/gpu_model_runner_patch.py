@@ -10,7 +10,7 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR, GRStageKind
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
@@ -22,6 +22,7 @@ from vllm_gr.v1.worker.gr_context import (
     _beam_graph_enabled_for_run,
     _create_beam_context,
     _get_gr_config,
+    is_hybrid_model,
 )
 
 # Shared context helpers and installation contracts have independent owners.
@@ -519,6 +520,13 @@ make_patched_determine_batch_execution_and_padding = (
 )
 
 
+def _record_prefill_graph_dispatch(runner, key: str) -> None:
+    dispatches = getattr(runner, "_gr_prefill_graph_dispatches", None)
+    if dispatches is None:
+        dispatches = runner._gr_prefill_graph_dispatches = {}
+    dispatches[key] = dispatches.get(key, 0) + 1
+
+
 def make_patched_model_forward_gpu(_orig_model_forward):
     """Wrap _model_forward to intercept and replay pure prefill CUDA graphs."""
     if getattr(_orig_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, False):
@@ -528,42 +536,53 @@ def make_patched_model_forward_gpu(_orig_model_forward):
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
         scheduler_output = getattr(self, "_current_scheduler_output", None)
         gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
+        if is_hybrid_model(self):
+            # Grouped caches use the native Prefill graph and its metadata.
+            result = _orig_model_forward(self, input_ids, positions, *args, **kwargs)
+            if (
+                gr_stages
+                and len(gr_stages) == 1
+                and getattr(next(iter(gr_stages.values())), "kind", None) is GRStageKind.PREFILL
+                and not getattr(self.model_config, "enforce_eager", False)
+            ):
+                from vllm.forward_context import (
+                    get_forward_context,
+                    is_forward_context_available,
+                )
+
+                if is_forward_context_available():
+                    mode = get_forward_context().cudagraph_runtime_mode.name
+                    _record_prefill_graph_dispatch(self, f"native:{mode}")
+            return result
+
         batch_view = None
         if gr_stages:
             # Decode uses its independent startup graph. A Batch Session has
             # exactly one stage descriptor whose request_ids define the
             # immutable logical order for this Prefill dispatch.
             if len(gr_stages) != 1:
-                return _orig_model_forward(
-                    self, input_ids=input_ids, positions=positions, *args, **kwargs
-                )
+                return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
             try:
                 batch_view = BeamBatchExecutionView.from_stage_metadata(
                     next(iter(gr_stages.values()))
                 )
             except BeamExecutionContractError:
                 logger.debug("Prefill CUDA graph fallback: invalid_batch_contract")
-                return _orig_model_forward(
-                    self, input_ids=input_ids, positions=positions, *args, **kwargs
-                )
+                return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
             if batch_view.kind != "prefill":
-                return _orig_model_forward(
-                    self, input_ids=input_ids, positions=positions, *args, **kwargs
-                )
+                return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
             if getattr(self.model_config, "enforce_eager", False):
                 logger.debug("Prefill CUDA graph fallback: enforce_eager")
-                return _orig_model_forward(
-                    self, input_ids=input_ids, positions=positions, *args, **kwargs
-                )
+                return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
             if is_prefill_graph_enabled(self) and not hasattr(self, "_prefill_graph_runner"):
                 logger.debug("Prefill CUDA graph fallback: runner_not_initialized")
-                return _orig_model_forward(
-                    self, input_ids=input_ids, positions=positions, *args, **kwargs
-                )
+                return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
         if scheduler_output is not None:
+            can_replay = is_prefill_graph_enabled(self) and is_prefill_phase_batch(
+                self, scheduler_output
+            )
             if (
-                is_prefill_graph_enabled(self)
-                and is_prefill_phase_batch(self, scheduler_output)
+                can_replay
                 # Dense-Prefill graphs replay only for fresh prompts.
                 and (
                     _get_gr_config(self).deployment.dense_prefill == "off"
@@ -579,16 +598,12 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                         logger.debug(
                             "Prefill CUDA graph fallback: batch_session_missing_request_ids"
                         )
-                        return _orig_model_forward(
-                            self, input_ids=input_ids, positions=positions, *args, **kwargs
-                        )
+                        return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
                     try:
                         batch_view.validate_request_order(tuple(raw_scheduled_tokens))
                     except BeamExecutionContractError:
                         logger.debug("Prefill CUDA graph fallback: batch_session_request_order")
-                        return _orig_model_forward(
-                            self, input_ids=input_ids, positions=positions, *args, **kwargs
-                        )
+                        return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
                 num_reqs = (
                     batch_view.batch_size if batch_view is not None else len(raw_scheduled_tokens)
                 )
@@ -610,7 +625,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                         # live: the Prefill runner copies that prefix, preserves
                         # real Attention lengths, and masks its own padded KV
                         # slots. Native padding must not determine GR's bucket.
-                        if (
+                        unsupported_inputs = (
                             input_ids is None
                             or input_ids.ndim != 1
                             or input_ids.shape[0] < total_tokens
@@ -618,7 +633,8 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                             or tuple(positions.shape) != tuple(input_ids.shape)
                             or kwargs.get("inputs_embeds") is not None
                             or kwargs.get("intermediate_tensors") is not None
-                        ):
+                        )
+                        if unsupported_inputs:
                             reason = "unsupported_inputs"
                             bucket = None
                     if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
@@ -634,7 +650,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                                     blk_table.slot_mapping, "gpu"
                                 ):
                                     slot_mapping = blk_table.slot_mapping.gpu
-                            except Exception as e:
+                            except (AttributeError, IndexError, TypeError) as e:
                                 logger.warning("Could not get slot_mapping: %r", e)
                         output_buf = p_runner.execute_model_prefill(
                             bucket=bucket,
@@ -645,11 +661,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                         )
 
                         if output_buf is not None:
-                            dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
-                            if dispatches is None:
-                                dispatches = self._gr_prefill_graph_dispatches = {}
-                            key = f"replay:{num_reqs}"
-                            dispatches[key] = dispatches.get(key, 0) + 1
+                            _record_prefill_graph_dispatch(self, f"replay:{num_reqs}")
                             logger.debug(
                                 "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
                                 "bucket=%s outcome=replay",
@@ -659,11 +671,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                             )
                             return output_buf
                         reason = getattr(p_runner, "last_replay_reason", "runner_rejected")
-                    dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
-                    if dispatches is None:
-                        dispatches = self._gr_prefill_graph_dispatches = {}
-                    key = f"fallback:{num_reqs}:{reason}"
-                    dispatches[key] = dispatches.get(key, 0) + 1
+                    _record_prefill_graph_dispatch(self, f"fallback:{num_reqs}:{reason}")
                     logger.debug(
                         "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
                         "bucket=%s outcome=%s",
@@ -672,7 +680,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                         bucket,
                         reason,
                     )
-        return _orig_model_forward(self, input_ids=input_ids, positions=positions, *args, **kwargs)
+        return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
 
     setattr(patched_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, True)
     return patched_model_forward
@@ -685,7 +693,7 @@ def capture_prefill_graphs(runner) -> None:
     only when the prefill graph env gate is enabled. Only explicitly
     recoverable capture failures fall back to eager prefill.
     """
-    if not is_prefill_graph_enabled(runner):
+    if is_hybrid_model(runner) or not is_prefill_graph_enabled(runner):
         return
     if getattr(runner, "_prefill_graphs_captured", False):
         return

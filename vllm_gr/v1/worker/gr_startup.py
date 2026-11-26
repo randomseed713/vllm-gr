@@ -24,6 +24,7 @@ from vllm_gr.v1.beam.dispatch import (
     GRStageMetadata,
 )
 from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
+from vllm_gr.v1.worker.gr_context import is_hybrid_model
 
 if TYPE_CHECKING:
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
@@ -35,7 +36,7 @@ def capture_async_forward(
     worker: Any,
     *,
     hooks_type: CudaStageHooksType | None = None,
-    allow_eager_fallback: bool = False,
+    allow_eager_fallback: bool | None = None,
 ) -> bool:
     with torch.inference_mode():
         if not _capture_enabled(worker):
@@ -58,6 +59,8 @@ def capture_async_forward(
             return False
         if hooks_type is None:
             raise ValueError("CUDA GR startup capture requires explicit stage hooks")
+        if allow_eager_fallback is None:
+            allow_eager_fallback = is_hybrid_model(worker)
         from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
         from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
@@ -82,8 +85,7 @@ def capture_async_forward(
                 "dynamic Decode (batch, width) shapes lazily on first use."
             )
 
-        max_reqs = worker.vllm_config.scheduler_config.max_num_seqs
-        batches = tuple(b for b in cfg.deployment.beam_batch_sizes if b <= max_reqs)
+        batches = decode_capture_batches(worker)
         if not batches:
             return False
         if hasattr(worker, "_gr_decode_capture_failures"):
@@ -137,12 +139,33 @@ def _capture_enabled(worker: Any) -> bool:
         raise ValueError("unconstrained Beam V1 requires CUDA or NPU")
     if mode is ConstraintMode.NONE and str(worker.device).split(":")[0] == "npu":
         validate_gr_device_config(worker.vllm_config)
+    if is_hybrid_model(worker):
+        from vllm_gr.v1.worker.cuda.hybrid_beam_graph import (
+            supports_grouped_decode_graph,
+        )
+
+        if not supports_grouped_decode_graph(worker):
+            return False
     # A one-token session completes in Prefill and never replays a Decode graph.
     return (
         not worker.model_config.enforce_eager
         and cfg.beam_graph_enabled
         and cfg.beam_max_decode_steps > 1
     )
+
+
+def decode_capture_batches(worker: Any) -> tuple[int, ...]:
+    """Filter configured shapes against the selected cache's model-row capacity."""
+    from vllm_gr.v1.worker.gr_context import _get_gr_config
+
+    cfg = _get_gr_config(worker)
+    scheduler = worker.vllm_config.scheduler_config
+    limit = scheduler.max_num_seqs
+    if is_hybrid_model(worker):
+        width = cfg.beam_max_width
+        assert width is not None
+        limit = min(limit, scheduler.max_num_batched_tokens) // width
+    return tuple(batch for batch in cfg.deployment.beam_batch_sizes if batch <= limit)
 
 
 def _capture_batch(
@@ -153,7 +176,10 @@ def _capture_batch(
     allow_eager_fallback: bool,
 ) -> str | None:
     """Capture the explicit batch selected by the V1 or V2 entry point."""
-    from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
+    from vllm_gr.v1.worker.cuda.beam_decode_graph import (
+        BeamDecodeCaptureUnsupported,
+        drain_failed_decode_capture,
+    )
     from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
         get_stage_runner,
     )
@@ -210,18 +236,19 @@ def _capture_batch(
                 output_device_state=GRDeviceStateRef(name, 1),
                 kv_blocks=((0,),) * batch_size,
             )
-            owner.prepared = owner.prepare_cpu(decode, 0)
-            owner._bind_attention(decode)
-            # Keep the startup fallback graph at model capacity. Measured
-            # length buckets are captured lazily against real request buffers.
-            if getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0):
-                assert owner.inputs is not None
-                owner.metadata.prefix_length_bucket = 0
-                owner.metadata.prefix_max_seq_len = (
-                    (owner.inputs.max_model_len + owner.inputs.block_size - 1)
-                    // owner.inputs.block_size
-                    * owner.inputs.block_size
-                )
+            if not getattr(owner, "uses_native_cache", False):
+                owner.prepared = owner.prepare_cpu(decode, 0)
+                owner._bind_attention(decode)
+                # Keep the startup fallback graph at model capacity. Measured
+                # length buckets are captured lazily against real request buffers.
+                if getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0):
+                    assert owner.inputs is not None
+                    owner.metadata.prefix_length_bucket = 0
+                    owner.metadata.prefix_max_seq_len = (
+                        (owner.inputs.max_model_len + owner.inputs.block_size - 1)
+                        // owner.inputs.block_size
+                        * owner.inputs.block_size
+                    )
             owner.input_ids.zero_()
             owner.positions.zero_()
             owner.execution_mask.zero_()
@@ -231,11 +258,7 @@ def _capture_batch(
             except BeamDecodeCaptureUnsupported as error:
                 if not allow_eager_fallback:
                     raise
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("Decode capture did not leave capture mode") from error
-                # Failed capture ran on a side stream. Drain it before ending
-                # the dummy session; a device error here aborts startup.
-                torch.accelerator.synchronize(worker.device)
+                drain_failed_decode_capture(worker.device, error)
                 fallback_error = error
         finally:
             done = torch.Event()

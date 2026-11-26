@@ -318,6 +318,7 @@ def test_startup_capture_is_reused_across_prompt_lengths_and_budgets(monkeypatch
         )
 
     monkeypatch.setattr(GPUBeamStageRunner, "_forward", unexpected_forward)
+    worker.input_batch = SimpleNamespace(req_ids=["session-0"])
     for prompt, budget in [(7, 1), (13, 2), (21, 3), (11, 1)]:
         first = replace(
             metadata(n=budget),

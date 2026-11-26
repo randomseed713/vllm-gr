@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Condition, Lock
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.cuda.streams import Event as CUDAEvent
@@ -85,6 +85,13 @@ from vllm_gr.v1.worker.cuda.gr_inputs import (
     PreparedGRInputs,
     bind_device_inputs,
 )
+
+if TYPE_CHECKING:
+    from vllm_gr.ops.cuda.beam_kv_reorder import CacheBlockCopy
+    from vllm_gr.v1.worker.cuda.hybrid_beam_cache import (
+        CacheGroupBindings,
+        HybridDecodeBatch,
+    )
 
 METADATA_ABI = 1
 _UNCONSTRAINED_HEAD_LAYOUT_LOCK = Lock()
@@ -257,6 +264,46 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         )
         setattr(out, GR_WORKER_RESULT_ATTR, results)
         return out
+
+
+def decode_width(owner: GPUBeamStageRunner) -> int:
+    if owner.inputs is not None:
+        return owner.inputs.width
+    return int(owner.input_ids.numel()) // len(owner.bindings)
+
+
+def capture_decode_forward(
+    graph: Any, owner: GPUBeamStageRunner, *, persistent_install: bool
+) -> None:
+    """Use the shared graph registry with the cache layout's stable input views."""
+    if not getattr(owner, "uses_native_cache", False):
+        graph.capture(owner._forward_hidden, persistent_install=persistent_install)
+        return
+    if graph.ready:
+        return
+    from vllm_gr.v1.worker.cuda.hybrid_beam_graph import GroupedDecodeGraphInputs
+
+    inputs = GroupedDecodeGraphInputs(owner.worker, graph.signature.num_model_rows)
+
+    def forward(capture: bool) -> torch.Tensor:
+        return owner.hooks.forward_hidden(
+            inputs.input_ids, inputs.positions, inputs.attention, inputs.slots, capture
+        )
+
+    # Grouped replay uses the registry directly. Scope the capture wrapper so
+    # native Prefill retains the model wrapper and its graph dispatch.
+    graph.capture(forward, persistent_install=False)
+    graph.cache_group_inputs[graph.signature] = inputs
+
+
+def replay_decode_forward(graph: Any, owner: GPUBeamStageRunner) -> torch.Tensor | None:
+    batch = getattr(owner, "cache_group_batch", None)
+    if batch is not None:
+        from vllm.model_executor.offloader import get_offloader
+
+        graph.cache_group_inputs[graph.signature].load(owner, batch)
+        get_offloader().sync_prev_onload()
+    return _hidden_logits(owner, graph.replay())
 
 
 def should_replay_decode_graph(
@@ -557,6 +604,10 @@ class GPUBeamStageRunner:
         self.prepared: PreparedGRInputs | None = None
         self.final_output: GPUBeamFinalOutput
         self.metadata: Any = None
+        self.uses_native_cache = bool(getattr(beam.session.context, "use_native_cache", False))
+        self.cache_group_batch: HybridDecodeBatch | None = None
+        self.cache_group_bindings: CacheGroupBindings | None = None
+        self.cache_group_copies: tuple[CacheBlockCopy, ...] | None = None
         self.graph: Any = None
         self.logits: torch.Tensor | None = None
         batch_size = len(bindings)
@@ -758,6 +809,14 @@ class GPUBeamStageRunner:
 
     def prepare_decode(self, entry: BeamDispatchEntry) -> None:
         # Device binding has no dependency on Host output consumption.
+        if self.uses_native_cache:
+            from vllm_gr.v1.worker.cuda.hybrid_beam_cache import prepare_hybrid_decode
+
+            view = BeamBatchExecutionView.from_stage_metadata(entry.metadata)
+            if self.dynamic is not None:
+                self.dynamic.activate(view.input_width)
+            self.cache_group_batch = prepare_hybrid_decode(self, entry.metadata, view)
+            return
         prepared = self.prepared
         if prepared is None:
             raise RuntimeError(
@@ -782,12 +841,22 @@ class GPUBeamStageRunner:
         if bucket:
             assert self.inputs is not None
             graph.select(len(self.bindings), self.inputs.width, bucket)
-        graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
+        capture_decode_forward(graph, self, persistent_install=self.hooks.persistent_graph_install)
         return graph
 
     def _forward(self) -> torch.Tensor | None:
         """Eager Decode entry point; publishes hidden when the head is sliced."""
 
+        if self.cache_group_batch is not None:
+            from vllm_gr.v1.worker.cuda.hybrid_beam_cache import build_hybrid_attention
+
+            batch = self.cache_group_batch
+            self.attention, self.slot_mappings = build_hybrid_attention(
+                self.worker,
+                batch,
+                self.positions,
+                max_seq_len=int(batch.seq_lens_cpu.max()),
+            )
         return _hidden_logits(self, self._forward_hidden(False))
 
     def head_slice_cols(self, rows: int) -> int:
@@ -910,7 +979,8 @@ class GPUBeamStageRunner:
             else:
                 # Pure CPU work can run before the native Prefill staging fence.
                 assert self.pending is not None
-                self.prepared = self.prepare_cpu(m, self.pending[1])
+                if not self.uses_native_cache:
+                    self.prepared = self.prepare_cpu(m, self.pending[1])
                 if previous_kind is GRStageKind.PREFILL:
                     # Native Prefill may asynchronously read reused CPU input
                     # buffers that the native state update mutates.  The
@@ -919,8 +989,18 @@ class GPUBeamStageRunner:
                 # Decode does not upload these native input buffers again, so
                 # subsequent Decode dispatches need no Host input-prep wait.
                 self.hooks.consume_native_state(scheduler_output)
-                self._bind_attention(m)
+                if not self.uses_native_cache:
+                    self._bind_attention(m)
                 self.prepare_decode(entry)
+                if self.uses_native_cache:
+                    from vllm_gr.v1.worker.cuda.hybrid_beam_graph import (
+                        supports_grouped_decode_graph,
+                    )
+
+                    if not supports_grouped_decode_graph(worker):
+                        self.graph = None
+                        self.logits = self._forward()
+                        continue
                 self.logits = self.hooks.decode_logits(self)
         return None
 
@@ -1161,6 +1241,7 @@ class GPUBeamStageRunner:
                 raise RuntimeError("GR release requires dispatch and output-consumer drain")
         torch.cuda.current_stream(self.beam.state.device).wait_event(self.last_work)
         self.beam.end_session(consumer_done=consumer_done)
+        self.cache_group_batch = self.cache_group_bindings = None
         # Keep fixed-address graph storage for compatible, fully drained reuse.
         self.closed = True
         self.beam.session.context._gr_execution_owner = None
@@ -1234,6 +1315,39 @@ def execute_gr_retirement(worker: Any, scheduler_output: Any) -> AsyncGRRetireOu
     owner.hooks.consume_retirement_state(scheduler_output, owner.bindings)
     worker._gr_retirement_output = result
     return result
+
+
+def _validate_split_cache(worker: Any) -> None:
+    if len(worker.kv_cache_config.kv_cache_groups) != 1:
+        raise ValueError("persistent GR requires one uniform KV group")
+    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+
+    layers = worker.compilation_config.static_forward_context
+    for group in worker.kv_cache_config.kv_cache_groups:
+        for name in group.layer_names:
+            impl = getattr(layers.get(name), "impl", None)
+            if not isinstance(impl, BeamAttentionImpl):
+                raise ValueError(  # noqa: TRY004
+                    "persistent GR requires Beam Attention on every KV layer"
+                )
+            # Packed beam queries do not preserve sliding-window positions
+            # across the prefix/suffix split. No window is stored as (-1, -1).
+            if impl.sliding_window != (-1, -1):
+                raise ValueError(
+                    "persistent GR split attention does not support sliding-window attention: "
+                    f"{name} (window={impl.sliding_window})"
+                )
+    head_size = worker.model_config.get_head_size()
+    if (
+        head_size <= 0
+        or head_size & (head_size - 1)
+        or getattr(worker.model_config, "quantization", None) is not None
+        or worker.cache_config.cache_dtype
+        not in ("auto", str(worker.model_config.dtype).removeprefix("torch."))
+    ):
+        raise ValueError(
+            "persistent GR requires unquantized FP16/BF16 KV and a power-of-two head size"
+        )
 
 
 def get_stage_runner(
@@ -1315,42 +1429,17 @@ def get_stage_runner(
         )
     if (
         worker.model_config.is_encoder_decoder
-        or worker.model_config.is_hybrid
         or worker.supports_mm_inputs
         or getattr(worker, "lora_config", None) is not None
         or getattr(worker.vllm_config, "kv_transfer_config", None) is not None
     ):
         raise ValueError("persistent GR requires a text decoder without LoRA or KV transfer")
-    if len(worker.kv_cache_config.kv_cache_groups) != 1:
-        raise ValueError("persistent GR requires one uniform KV group")
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionImpl
+    if worker.model_config.is_hybrid:
+        from vllm_gr.v1.worker.cuda.hybrid_beam_cache import validate_hybrid_cache
 
-    layers = worker.compilation_config.static_forward_context
-    for group in worker.kv_cache_config.kv_cache_groups:
-        for name in group.layer_names:
-            impl = getattr(layers.get(name), "impl", None)
-            if not isinstance(impl, BeamAttentionImpl):
-                raise ValueError(  # noqa: TRY004
-                    "persistent GR requires Beam Attention on every KV layer"
-                )
-            # Packed beam queries do not preserve sliding-window positions
-            # across the prefix/suffix split. No window is stored as (-1, -1).
-            if impl.sliding_window != (-1, -1):
-                raise ValueError(
-                    "persistent GR split attention does not support sliding-window attention: "
-                    f"{name} (window={impl.sliding_window})"
-                )
-    head_size = worker.model_config.get_head_size()
-    if (
-        head_size <= 0
-        or head_size & (head_size - 1)
-        or getattr(worker.model_config, "quantization", None) is not None
-        or worker.cache_config.cache_dtype
-        not in ("auto", str(worker.model_config.dtype).removeprefix("torch."))
-    ):
-        raise ValueError(
-            "persistent GR requires unquantized FP16/BF16 KV and a power-of-two head size"
-        )
+        validate_hybrid_cache(worker, m, for_startup_capture=for_startup_capture)
+    else:
+        _validate_split_cache(worker)
     if getattr(worker, "_beam_postprocess_workspaces", None) is None:
         raise ValueError("persistent GR requires prewarmed Beam postprocess workspace")
     if getattr(worker, "_beam_sessions", {}):
