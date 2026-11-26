@@ -24,6 +24,7 @@ from vllm_gr.v1.beam.dispatch import (
     GRStageMetadata,
 )
 from vllm_gr.v1.engine.beam_admission import validate_gr_device_config
+from vllm_gr.v1.worker.gr_context import is_hybrid_model
 
 if TYPE_CHECKING:
     from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
@@ -35,7 +36,7 @@ def capture_async_forward(
     worker: Any,
     *,
     hooks_type: CudaStageHooksType | None = None,
-    allow_eager_fallback: bool = False,
+    allow_eager_fallback: bool | None = None,
 ) -> bool:
     with torch.inference_mode():
         if not _capture_enabled(worker):
@@ -58,6 +59,8 @@ def capture_async_forward(
             return False
         if hooks_type is None:
             raise ValueError("CUDA GR startup capture requires explicit stage hooks")
+        if allow_eager_fallback is None:
+            allow_eager_fallback = is_hybrid_model(worker)
         from vllm_gr.v1.worker.cuda.gpu_stage_hooks import validate_stage_hooks_type
         from vllm_gr.v1.worker.cuda.v2.gpu_beam_stage_runner_v2 import CudaStageHooksV2
 
@@ -122,7 +125,7 @@ def capture_async_forward(
 
 def _capture_enabled(worker: Any) -> bool:
     from vllm_gr.config.models import ConstraintMode, configured_constraint_mode
-    from vllm_gr.v1.worker.gr_context import _get_gr_config, is_hybrid_model
+    from vllm_gr.v1.worker.gr_context import _get_gr_config
 
     cfg = _get_gr_config(worker)
     validate_gr_execution_runtime(worker.vllm_config)
@@ -153,7 +156,7 @@ def _capture_enabled(worker: Any) -> bool:
 
 def decode_capture_batches(worker: Any) -> tuple[int, ...]:
     """Filter configured shapes against the selected cache's model-row capacity."""
-    from vllm_gr.v1.worker.gr_context import _get_gr_config, is_hybrid_model
+    from vllm_gr.v1.worker.gr_context import _get_gr_config
 
     cfg = _get_gr_config(worker)
     scheduler = worker.vllm_config.scheduler_config
@@ -173,7 +176,10 @@ def _capture_batch(
     allow_eager_fallback: bool,
 ) -> str | None:
     """Capture the explicit batch selected by the V1 or V2 entry point."""
-    from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
+    from vllm_gr.v1.worker.cuda.beam_decode_graph import (
+        BeamDecodeCaptureUnsupported,
+        drain_failed_decode_capture,
+    )
     from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
         get_stage_runner,
     )
@@ -250,13 +256,9 @@ def _capture_batch(
             try:
                 graph = owner.capture_forward()
             except BeamDecodeCaptureUnsupported as error:
-                if not allow_eager_fallback and not getattr(owner, "uses_native_cache", False):
+                if not allow_eager_fallback:
                     raise
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("Decode capture did not leave capture mode") from error
-                # Failed capture ran on a side stream. Drain it before ending
-                # the dummy session; a device error here aborts startup.
-                torch.accelerator.synchronize(worker.device)
+                drain_failed_decode_capture(worker.device, error)
                 fallback_error = error
         finally:
             done = torch.Event()

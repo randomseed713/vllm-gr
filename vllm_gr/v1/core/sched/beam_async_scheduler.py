@@ -6,7 +6,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from itertools import islice
 from typing import Any
+
+from vllm.utils.math_utils import cdiv
 
 from vllm_gr.config.execution import validate_gr_execution_config
 from vllm_gr.v1.beam.batch_contracts import (
@@ -40,7 +43,6 @@ from vllm_gr.v1.core.sched.beam_session import (
 )
 from vllm_gr.v1.core.sched.hybrid_prefill import (
     hybrid_prefill_scope,
-    release_hybrid_prefill_dispatch,
     release_hybrid_prefill_pins,
 )
 from vllm_gr.v1.engine.beam_admission import (
@@ -179,16 +181,11 @@ def _gr_admission(scheduler: Any, owner: GRSessionState, prefill_chunk: str | No
             kwargs["reserved_blocks"] = kwargs.get("reserved_blocks", 0) + reserve_for_request
         result = allocate(request, num_new_tokens, *args, **kwargs)
         if result is not None and branch_blocks and not owner._hybrid_beam_blocks:
-            blocks = manager.block_pool.get_new_blocks(branch_blocks)
-            members = []
-            offset = 0
-            for counts in owner.hybrid_beam_block_counts:
-                groups = []
-                for count in counts:
-                    groups.append(tuple(blocks[offset : offset + count]))
-                    offset += count
-                members.append(tuple(groups))
-            owner._hybrid_beam_blocks = tuple(members)
+            blocks = iter(manager.block_pool.get_new_blocks(branch_blocks))
+            owner._hybrid_beam_blocks = tuple(
+                tuple(tuple(islice(blocks, count)) for count in counts)
+                for counts in owner.hybrid_beam_block_counts
+            )
         if result is None and owner.issued_stages:
             raise RuntimeError(
                 "Asynchronous scheduling lost reserved KV capacity after Beam generation"
@@ -220,7 +217,9 @@ def _drain_resources(scheduler: Any, session: GRSessionState) -> None:
 
 
 def complete_hybrid_prefill_chunk(scheduler: Any, session: GRSessionState) -> None:
-    release_hybrid_prefill_dispatch(scheduler, session)
+    if (dispatch := session.hybrid_prefill_dispatch) is not None:
+        session.release_kv_dispatch(scheduler, dispatch)
+        session._hybrid_prefill_dispatch = None
     advance_gr_progress(scheduler)
     if session.resource_status is GRResourceStatus.DRAINING:
         _drain_resources(scheduler, session)
@@ -334,6 +333,11 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     session_id = request.batch_id
     engine_requests = tuple(item.request for item in request.items)
     request_ids = tuple(engine_request.request_id for engine_request in engine_requests)
+    prompt_lengths = tuple(
+        len(engine_request.prompt_token_ids) for engine_request in engine_requests
+    )
+    # Prefill produces the first output token.
+    decode_steps = request.beam_params.max_tokens - 1
     sessions = getattr(scheduler, "_gr_v1_sessions", {})
     if session_id in sessions:
         raise GRAdmissionError(f"GR session already exists: {session_id}")
@@ -361,16 +365,10 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     hybrid_decode_reserve = 0
     manager = getattr(scheduler, "kv_cache_manager", None)
     if manager is not None:
-        pool = manager.block_pool
-        block_size = scheduler.cache_config.block_size
-        required_blocks = 0
-        for engine_request in engine_requests:
-            extent = len(engine_request.prompt_token_ids) + request.beam_params.max_tokens - 1
-            required_blocks += (extent + block_size - 1) // block_size
-            if extent >= manager.max_model_len:
-                raise GRAdmissionError(
-                    "Asynchronous scheduling request exceeds the total native KV capacity"
-                )
+        if max(prompt_lengths) + decode_steps >= manager.max_model_len:
+            raise GRAdmissionError(
+                "Asynchronous scheduling request exceeds the total native KV capacity"
+            )
         if getattr(getattr(config, "model_config", None), "is_hybrid", False):
             from vllm_gr.v1.beam.hybrid_cache import hybrid_block_budget
 
@@ -383,12 +381,12 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
                 budgets = tuple(
                     hybrid_block_budget(
                         scheduler.kv_cache_config.kv_cache_groups,
-                        prompt_tokens=len(engine_request.prompt_token_ids),
-                        decode_steps=request.beam_params.max_tokens - 1,
+                        prompt_tokens=length,
+                        decode_steps=decode_steps,
                         beam_width=request.beam_params.beam_width,
                         hash_block_size=hash_block_size,
                     )
-                    for engine_request in engine_requests
+                    for length in prompt_lengths
                 )
             except ValueError as error:
                 raise GRAdmissionError(str(error)) from error
@@ -400,7 +398,12 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
             if len(engine_requests) > 1:
                 # Native admission applies the watermark to waiting siblings.
                 required_blocks += manager.watermark_blocks
-        if required_blocks > pool.num_gpu_blocks - 1:
+        else:
+            required_blocks = sum(
+                cdiv(length + decode_steps, scheduler.cache_config.block_size)
+                for length in prompt_lengths
+            )
+        if required_blocks > manager.block_pool.num_gpu_blocks - 1:
             raise GRAdmissionError(
                 "Asynchronous scheduling batch exceeds the total native KV capacity"
             )
@@ -408,9 +411,7 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     max_num_seqs = getattr(scheduler_config, "max_num_seqs", len(engine_requests))
     if len(engine_requests) > max_num_seqs:
         raise GRAdmissionError("Beam batch size exceeds the native Scheduler max_num_seqs")
-    total_prompt_tokens = sum(
-        len(engine_request.prompt_token_ids) for engine_request in engine_requests
-    )
+    total_prompt_tokens = sum(prompt_lengths)
     scheduling_token_budget = getattr(scheduler, "max_num_scheduled_tokens", None)
     if scheduling_token_budget is None:
         scheduling_token_budget = getattr(
@@ -425,9 +426,7 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     return GRSessionState(
         session_id=session_id,
         request=request,
-        # The final Prefill invocation produces output token 0; the remaining
-        # max_tokens - 1 invocations are Decode stages.
-        max_decode_steps=max(0, request.beam_params.max_tokens - 1),
+        max_decode_steps=decode_steps,
         hybrid_beam_block_counts=branch_counts,
         hybrid_decode_reserved_blocks=hybrid_decode_reserve,
     )
@@ -557,13 +556,15 @@ def attach_gr_stage_metadata(
         lease_groups: list[tuple[Any, ...]] = []
         block_rows: list[tuple[int, ...]] = []
         prompt_blocks = []
+        hold_for_decode = kind is GRStageKind.PREFILL and bool(session._hybrid_beam_blocks)
         for request_id in request_ids:
             kv = manager.get_blocks(request_id)
-            if kind is GRStageKind.PREFILL and session._hybrid_beam_blocks:
+            if hold_for_decode:
                 prompt_blocks.append(tuple(tuple(group) for group in kv.blocks))
+            else:
+                lease_groups.extend(tuple(reversed(group)) for group in kv.blocks)
             for group in kv.blocks:
                 touched.extend(group)
-                lease_groups.append(tuple(reversed(group)))
             # Split-attention Decode uses one prompt row. Hybrid Decode uses
             # the native Worker's per-group block tables and private blocks.
             if len(kv.blocks) == 1:
@@ -583,14 +584,11 @@ def attach_gr_stage_metadata(
             kv_blocks = tuple(block_rows)
         if touched:
             manager.block_pool.touch(touched)
-            session._kv_dispatch_leases[dispatch_id] = tuple(lease_groups)
-        if prompt_blocks:
-            # The native table can advance or retire a recurrent block after
-            # Prefill. Decode forks the Prefill state and retains its lease.
-            manager.block_pool.touch(
-                [block for member in prompt_blocks for group in member for block in group]
-            )
-            session._hybrid_prompt_blocks = tuple(prompt_blocks)
+            if hold_for_decode:
+                # Final Prefill's lease also covers every Decode fork.
+                session._hybrid_prompt_blocks = tuple(prompt_blocks)
+            else:
+                session._kv_dispatch_leases[dispatch_id] = tuple(lease_groups)
     metadata = GRStageMetadata(
         session_id=session.session_id,
         dispatch_id=dispatch_id,
@@ -734,11 +732,7 @@ def update_gr_from_output(
     # the Worker's persistent resources have been released.
     session._in_flight_dispatches.remove(metadata.dispatch_id)
     advance_gr_progress(scheduler)
-    lease_groups = session._kv_dispatch_leases.pop(metadata.dispatch_id, ())
-    for blocks in lease_groups:
-        # Match native per-group free calls: uncached blocks are prepended,
-        # cached blocks appended. Flattening groups changes eviction order.
-        scheduler.kv_cache_manager.block_pool.free_blocks(blocks)
+    session.release_kv_dispatch(scheduler, metadata.dispatch_id)
     try:
         if session._dispatch_records.get(metadata.dispatch_id) != metadata:
             raise _GRWorkerProtocolError("Scheduler dispatch identity changed")

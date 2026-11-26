@@ -1037,11 +1037,30 @@ def test_hybrid_private_blocks_reserve_capacity_and_wait_for_retirement() -> Non
     assert tuple(map(len, session._hybrid_beam_blocks[0])) == (3, 2)
     assert pool.get_num_free_blocks() == free - 7
 
-    session.worker_resources_allocated = True
+    native_groups = (native[:1], native[1:])
+    scheduler.kv_cache_manager.get_blocks = lambda _: KVCacheBlocks(native_groups)
+    request.num_computed_tokens = request.num_prompt_tokens
+    prefill = _scheduler_output()
+    stage = attach_gr_stage_metadata(scheduler, prefill, session)
+    assert stage is not None
+    assert stage.hybrid_prompt_blocks == (((native[0].block_id,), (native[1].block_id,)),)
+    assert all(block.ref_cnt == 2 for block in native)
+    setattr(prefill, GR_STAGE_OUTPUT_ATTR, {session.session_id: stage})
     session.status = GRSessionStatus.ABORTED
     _drain_resources(scheduler, session)
     pool.free_blocks(native)
-    assert pool.get_num_free_blocks() == free - 5
+    receipt = GRWorkerResult(
+        session.session_id,
+        stage.dispatch_id,
+        stage.stage_index,
+        1,
+        stage.output_device_state,
+        False,
+        owner_generation=session.owner_generation,
+    )
+    output = SimpleNamespace(**{GR_WORKER_RESULT_ATTR: {session.session_id: receipt}})
+    update_gr_from_output(scheduler, session, prefill, output)
+    assert pool.get_num_free_blocks() == free - 7
 
     scheduled = SimpleNamespace(total_num_scheduled_tokens=0, finished_req_ids=set())
     attach_gr_retirement(scheduler, scheduled)

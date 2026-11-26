@@ -25,6 +25,15 @@ class BeamDecodeCaptureUnsupported(RuntimeError):
     """Capture was refused; startup must still verify cleanup and device health."""
 
 
+def drain_failed_decode_capture(
+    device: torch.device | str, error: BeamDecodeCaptureUnsupported
+) -> None:
+    """Drain the capture stream before reusing buffers or releasing the owner."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Decode capture did not leave capture mode") from error
+    torch.accelerator.synchronize(device)
+
+
 @dataclass(frozen=True, slots=True)
 class BeamDecodeGraphSignature:
     batch_size: int

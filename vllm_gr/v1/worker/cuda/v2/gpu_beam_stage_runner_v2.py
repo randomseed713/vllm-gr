@@ -33,9 +33,11 @@ from typing import Any, ClassVar
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
+from vllm_gr.v1.worker.cuda.beam_decode_graph import (
+    BeamDecodeCaptureUnsupported,
+    drain_failed_decode_capture,
+)
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
@@ -45,6 +47,7 @@ from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     should_replay_decode_graph,
 )
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.cuda.gr_inputs import align_prefill_rows
 from vllm_gr.v1.worker.cuda.v2.gpu_model_runner_v2_resources import get_v2_runtime
 
 logger = init_logger(__name__)
@@ -145,11 +148,7 @@ class CudaStageHooksV2(CudaStageHooks):
             try:
                 capture_decode_forward(owner.graph, owner, persistent_install=False)
             except BeamDecodeCaptureUnsupported as error:
-                # Capture has restored the model wrapper. Drain its side stream
-                # before reusing live request buffers; unhealthy devices must fail.
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("Decode capture did not leave capture mode") from error
-                torch.accelerator.synchronize(worker.device)
+                drain_failed_decode_capture(worker.device, error)
                 owner.graph.discard_selected()
                 runtime.runtime_failures[geometry] = str(error)
                 owner.graph = None
@@ -239,31 +238,12 @@ class CudaStageHooksV2(CudaStageHooks):
         # force a device->host sync right after the Prefill forward — the
         # sampler's own indexing is the authoritative contract and needs none.
         batch = state.input_batch
-        stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
-        if not stages or len(stages) != 1:
-            raise ValueError("GR Prefill requires one logical batch's metadata")
-        request_ids = next(iter(stages.values())).request_ids
-        native_ids = batch.req_ids
-        if (
-            len(set(request_ids)) != len(request_ids)
-            or len(set(native_ids)) != len(native_ids)
-            or set(request_ids) != set(native_ids)
-            or len(batch.cu_num_logits_np) != len(request_ids) + 1
-            or any(b - a != 1 for a, b in zip(batch.cu_num_logits_np, batch.cu_num_logits_np[1:]))
+        if len(batch.cu_num_logits_np) != len(batch.req_ids) + 1 or any(
+            b - a != 1 for a, b in zip(batch.cu_num_logits_np, batch.cu_num_logits_np[1:])
         ):
             raise ValueError("GR Prefill requires exactly one logit row per batch member")
-        indices = batch.logits_indices
-        if tuple(native_ids) != tuple(request_ids):
-            from vllm.utils.torch_utils import async_tensor_h2d
-
-            native_rows = {request_id: row for row, request_id in enumerate(native_ids)}
-            order = async_tensor_h2d(
-                [native_rows[request_id] for request_id in request_ids],
-                device=worker.device,
-                dtype=torch.long,
-            )
-            indices = indices[order]
         # Restore only the sampled rows. Native request/KV order remains intact.
+        indices = align_prefill_rows(scheduler_output, batch.req_ids, batch.logits_indices)
         sample_hidden = state.hidden_states[indices]
         logits = worker.model.compute_logits(sample_hidden)
         # GR bypasses native sample_tokens/postprocess, which normally advances

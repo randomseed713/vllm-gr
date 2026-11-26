@@ -256,7 +256,6 @@ def apply_scheduler_patch():
             if checkpoint is not None:
                 owner, request_id = checkpoint
                 attach_hybrid_prefill_chunk(self, output, owner, request_id)
-                attach_gr_retirement(self, output)
                 return output
 
             gr_stages = {}

@@ -152,10 +152,9 @@ class BeamSearchRunner:
         self._kv_grid: tuple[int] | None = None
         self._kv_args: tuple[Any, ...] = ()
         self._kv_kwargs: dict[str, Any] = {}
-        if not getattr(context, "use_native_cache", False):
-            self._bind_split_cache(context, session.slot, width)
+        if getattr(context, "use_native_cache", False):
+            return
 
-    def _bind_split_cache(self, context: Any, slot: int, width: int) -> None:
         first = context.pools[0].unshared_key
         layers, aux = len(context.pools), context.aux_key_buf
         self._kv_capacity = first.shape[3]
@@ -165,25 +164,25 @@ class BeamSearchRunner:
             context.pool_value_ptrs,
             aux.data_ptr(),
             context.aux_value_buf.data_ptr(),
-            slot * first.stride(0) * first.element_size(),
+            session.slot * first.stride(0) * first.element_size(),
             width,
             self._state["num_decode_steps"],
         )
-        self._kv_kwargs = {
-            "H": first.shape[2],
-            "BLOCK_D": triton.next_power_of_2(first.shape[4]),
-            "D": first.shape[4],
-            "stride_pw": first.stride(1),
-            "stride_ph": first.stride(2),
-            "stride_ps": first.stride(3),
-            "stride_al": aux.stride(0),
-            "stride_aw": aux.stride(1),
-            "stride_ah": aux.stride(2),
-            "stride_as": aux.stride(3),
-            "active_mask": self._state["active_mask"],
-            "execute": self._scratch["reorder"],
-            "DEVICE_STEPS": True,
-        }
+        self._kv_kwargs = dict(
+            H=first.shape[2],
+            BLOCK_D=triton.next_power_of_2(first.shape[4]),
+            D=first.shape[4],
+            stride_pw=first.stride(1),
+            stride_ph=first.stride(2),
+            stride_ps=first.stride(3),
+            stride_al=aux.stride(0),
+            stride_aw=aux.stride(1),
+            stride_ah=aux.stride(2),
+            stride_as=aux.stride(3),
+            active_mask=self._state["active_mask"],
+            execute=self._scratch["reorder"],
+            DEVICE_STEPS=True,
+        )
 
     def rebind_session(self, session: BeamSearchSession) -> None:
         """Bind an admitted session after release, retaining fixed tensor views.

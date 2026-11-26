@@ -162,18 +162,10 @@ def attach_hybrid_prefill_chunk(
     manager = scheduler.kv_cache_manager
     groups = manager.get_blocks(request_id).blocks
     manager.block_pool.touch([block for group in groups for block in group])
-    session._hybrid_prefill_leases = tuple(tuple(reversed(group)) for group in groups)
     identity = (session.session_id, session.owner_generation, advance_gr_progress(scheduler))
+    session._kv_dispatch_leases[identity] = tuple(tuple(reversed(group)) for group in groups)
     session._hybrid_prefill_dispatch = identity
     setattr(output, HYBRID_PREFILL_ATTR, identity)
-
-
-def release_hybrid_prefill_dispatch(scheduler: Any, session: GRSessionState) -> None:
-    pool = scheduler.kv_cache_manager.block_pool
-    for group in session._hybrid_prefill_leases:
-        pool.free_blocks(group)
-    session._hybrid_prefill_leases = ()
-    session._hybrid_prefill_dispatch = None
 
 
 def release_hybrid_prefill_pins(scheduler: Any, session: GRSessionState) -> None:

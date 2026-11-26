@@ -520,6 +520,13 @@ make_patched_determine_batch_execution_and_padding = (
 )
 
 
+def _record_prefill_graph_dispatch(runner, key: str) -> None:
+    dispatches = getattr(runner, "_gr_prefill_graph_dispatches", None)
+    if dispatches is None:
+        dispatches = runner._gr_prefill_graph_dispatches = {}
+    dispatches[key] = dispatches.get(key, 0) + 1
+
+
 def make_patched_model_forward_gpu(_orig_model_forward):
     """Wrap _model_forward to intercept and replay pure prefill CUDA graphs."""
     if getattr(_orig_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, False):
@@ -545,11 +552,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
 
                 if is_forward_context_available():
                     mode = get_forward_context().cudagraph_runtime_mode.name
-                    dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
-                    if dispatches is None:
-                        dispatches = self._gr_prefill_graph_dispatches = {}
-                    key = f"native:{mode}"
-                    dispatches[key] = dispatches.get(key, 0) + 1
+                    _record_prefill_graph_dispatch(self, f"native:{mode}")
             return result
 
         batch_view = None
@@ -658,11 +661,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                         )
 
                         if output_buf is not None:
-                            dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
-                            if dispatches is None:
-                                dispatches = self._gr_prefill_graph_dispatches = {}
-                            key = f"replay:{num_reqs}"
-                            dispatches[key] = dispatches.get(key, 0) + 1
+                            _record_prefill_graph_dispatch(self, f"replay:{num_reqs}")
                             logger.debug(
                                 "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
                                 "bucket=%s outcome=replay",
@@ -672,11 +671,7 @@ def make_patched_model_forward_gpu(_orig_model_forward):
                             )
                             return output_buf
                         reason = getattr(p_runner, "last_replay_reason", "runner_rejected")
-                    dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
-                    if dispatches is None:
-                        dispatches = self._gr_prefill_graph_dispatches = {}
-                    key = f"fallback:{num_reqs}:{reason}"
-                    dispatches[key] = dispatches.get(key, 0) + 1
+                    _record_prefill_graph_dispatch(self, f"fallback:{num_reqs}:{reason}")
                     logger.debug(
                         "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
                         "bucket=%s outcome=%s",

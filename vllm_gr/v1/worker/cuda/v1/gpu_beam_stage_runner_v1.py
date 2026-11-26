@@ -11,7 +11,10 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
-from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupported
+from vllm_gr.v1.worker.cuda.beam_decode_graph import (
+    BeamDecodeCaptureUnsupported,
+    drain_failed_decode_capture,
+)
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
@@ -21,6 +24,7 @@ from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     should_replay_decode_graph,
 )
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
+from vllm_gr.v1.worker.cuda.gr_inputs import align_prefill_rows
 from vllm_gr.v1.worker.gr_context import is_hybrid_model
 
 logger = init_logger(__name__)
@@ -70,24 +74,9 @@ class CudaStageHooksV1(CudaStageHooks):
         out = original(worker, scheduler_output, *args, **kwargs)
         if out is not None or worker.execute_model_state is None:
             raise RuntimeError("native GR Prefill must return logits through execute_model_state")
-        logits = worker.execute_model_state.logits
-        if is_hybrid_model(worker):
-            from vllm.utils.torch_utils import async_tensor_h2d
-
-            from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
-
-            (stage,) = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR).values()
-            native_ids = tuple(worker.input_batch.req_ids)
-            if set(native_ids) != set(stage.request_ids) or logits.shape[0] != len(native_ids):
-                raise ValueError("Hybrid Beam Prefill must return one logit row per request")
-            if native_ids != stage.request_ids:
-                order = async_tensor_h2d(
-                    [native_ids.index(request_id) for request_id in stage.request_ids],
-                    device=worker.device,
-                    dtype=torch.long,
-                )
-                logits = logits.index_select(0, order)
-        return logits
+        return align_prefill_rows(
+            scheduler_output, worker.input_batch.req_ids, worker.execute_model_state.logits
+        )
 
     def finish_native_output(self) -> None:
         """Drop native results after GR has submitted its output work."""
@@ -176,13 +165,11 @@ class CudaStageHooksV1(CudaStageHooks):
                 except BeamDecodeCaptureUnsupported as error:
                     if not grouped:
                         raise
-                    if torch.cuda.is_current_stream_capturing():
-                        raise RuntimeError("Decode capture did not leave capture mode") from error
-                    torch.accelerator.synchronize(worker.device)
+                    drain_failed_decode_capture(worker.device, error)
                     graph.discard_selected()
                     graph.refused_group_shapes.add(graph.signature)
-                    owner.graph = None
                     logger.warning("Decode graph refused for %s: %s", graph.signature, error)
+                    owner.graph = None
                     return owner._forward()
             owner.graph = graph
         if should_replay_decode_graph(worker, owner.graph):

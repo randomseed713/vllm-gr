@@ -77,7 +77,9 @@ class GRSessionState:
     _in_flight_dispatches: set[int] = field(default_factory=set, init=False, repr=False)
     _pending_terminal_result: BeamBatchResult | None = field(default=None, init=False, repr=False)
     _terminal_emitted: bool = field(default=False, init=False, repr=False)
-    _kv_dispatch_leases: dict[int, Any] = field(default_factory=dict, init=False, repr=False)
+    _kv_dispatch_leases: dict[int | HybridPrefillDispatchId, Any] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _hybrid_beam_blocks: HybridBlockTable = field(default=(), init=False, repr=False)
     _hybrid_prompt_blocks: HybridBlockTable = field(default=(), init=False, repr=False)
     _hybrid_prefill_ready: set[str] = field(default_factory=set, init=False, repr=False)
@@ -87,7 +89,6 @@ class GRSessionState:
     _hybrid_prefill_dispatch: HybridPrefillDispatchId | None = field(
         default=None, init=False, repr=False
     )
-    _hybrid_prefill_leases: tuple[tuple[Any, ...], ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -133,6 +134,13 @@ class GRSessionState:
     @property
     def hybrid_prefill_dispatch(self) -> HybridPrefillDispatchId | None:
         return self._hybrid_prefill_dispatch
+
+    def release_kv_dispatch(
+        self, scheduler: Any, dispatch_id: int | HybridPrefillDispatchId
+    ) -> None:
+        for group in self._kv_dispatch_leases.pop(dispatch_id, ()):
+            # Separate per-group frees preserve native KV eviction order.
+            scheduler.kv_cache_manager.block_pool.free_blocks(group)
 
     @property
     def latest_device_state(self) -> GRDeviceStateRef | None:

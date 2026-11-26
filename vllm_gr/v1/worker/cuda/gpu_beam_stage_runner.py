@@ -815,7 +815,7 @@ class GPUBeamStageRunner:
             view = BeamBatchExecutionView.from_stage_metadata(entry.metadata)
             if self.dynamic is not None:
                 self.dynamic.activate(view.input_width)
-            self.cache_group_batch = prepare_hybrid_decode(self, entry.metadata)
+            self.cache_group_batch = prepare_hybrid_decode(self, entry.metadata, view)
             return
         prepared = self.prepared
         if prepared is None:
@@ -1435,10 +1435,8 @@ def get_stage_runner(
     ):
         raise ValueError("persistent GR requires a text decoder without LoRA or KV transfer")
     if worker.model_config.is_hybrid:
-        from vllm_gr.config.execution import validate_gr_execution_runtime
         from vllm_gr.v1.worker.cuda.hybrid_beam_cache import validate_hybrid_cache
 
-        validate_gr_execution_runtime(worker.vllm_config)
         validate_hybrid_cache(worker, m, for_startup_capture=for_startup_capture)
     else:
         _validate_split_cache(worker)

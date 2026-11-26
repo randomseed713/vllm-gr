@@ -183,14 +183,13 @@ def _recurrent_decode_blocks(
 
 
 def prepare_hybrid_decode(
-    owner: GPUBeamStageRunner, metadata: GRStageMetadata
+    owner: GPUBeamStageRunner, metadata: GRStageMetadata, view: BeamBatchExecutionView
 ) -> HybridDecodeBatch:
     """Fork native caches using device-resident Beam parents and build native metadata."""
     worker = owner.worker
-    step = metadata.decode_step
+    step = view.decode_step
     if step is None:
         raise ValueError("Grouped Beam cache binding requires a Decode step")
-    view = BeamBatchExecutionView.from_stage_metadata(metadata)
     width = view.input_width
     device = owner.beam.state.device
     binding = owner.cache_group_bindings
@@ -205,7 +204,7 @@ def prepare_hybrid_decode(
     )
     lengths = lengths_cpu.to(device, non_blocking=True)
     owner.device_positions = lengths.long() - 1
-    bind_beam_decode_state(metadata, owner)
+    bind_beam_decode_state(view, owner)
 
     # Inactive rows still get distinct writable state. Their candidates are
     # masked by the Beam state selector.

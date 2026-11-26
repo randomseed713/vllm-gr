@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Asynchronous scheduling CPU preparation and ordered device binding, independent of output consumption."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,7 +11,7 @@ import torch
 from vllm_gr.v1.attention.backends.beam_attn_metadata_layout import (
     build_async_batch_layout,
 )
-from vllm_gr.v1.beam.dispatch import GRStageMetadata
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR, GRStageMetadata
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 
 ERROR_DISPATCH_STATE = 6
@@ -165,6 +166,34 @@ class GRInputBuffers:
         }
 
 
+def align_prefill_rows(
+    scheduler_output: Any, native_ids: Sequence[str], rows: torch.Tensor
+) -> torch.Tensor:
+    """Align either native logits or sampling indices to logical Beam order."""
+    stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
+    if not stages or len(stages) != 1:
+        raise ValueError("GR Prefill requires one logical batch's metadata")
+    request_ids = next(iter(stages.values())).request_ids
+    native_rows = {request_id: row for row, request_id in enumerate(native_ids)}
+    if (
+        rows.shape[0] != len(native_ids)
+        or len(native_rows) != len(native_ids)
+        or len(native_ids) != len(request_ids)
+        or native_rows.keys() != set(request_ids)
+    ):
+        raise ValueError("GR Prefill requires exactly one logit row per batch member")
+    if tuple(native_ids) == tuple(request_ids):
+        return rows
+    from vllm.utils.torch_utils import async_tensor_h2d
+
+    order = async_tensor_h2d(
+        [native_rows[request_id] for request_id in request_ids],
+        device=rows.device,
+        dtype=torch.long,
+    )
+    return rows.index_select(0, order)
+
+
 def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
     """Read the predecessor's device state on the compute stream, without D2H."""
     m = prepared.metadata
@@ -174,19 +203,20 @@ def bind_device_inputs(prepared: PreparedGRInputs, owner: Any) -> None:
         raise ValueError(
             "Asynchronous scheduling prepared inputs belong to a different execution owner"
         )
-    running, width = bind_beam_decode_state(m, owner)
-    assert m.decode_step is not None
-    lengths = torch.where(running, m.decode_step + 1, 1).repeat_interleave(width)
+    view = prepared.batch_view or BeamBatchExecutionView.from_stage_metadata(m)
+    running = bind_beam_decode_state(view, owner)
+    assert view.decode_step is not None
+    lengths = torch.where(running, view.decode_step + 1, 1).repeat_interleave(view.input_width)
     owner.metadata.suffix_seqlens_kv_device.copy_(lengths)
     owner.metadata.suffix_cu_seqlens_k_device[0].zero_()
     torch.cumsum(lengths, dim=0, out=owner.metadata.suffix_cu_seqlens_k_device[1:])
 
 
-def bind_beam_decode_state(m: GRStageMetadata, owner: Any) -> tuple[torch.Tensor, int]:
+def bind_beam_decode_state(view: BeamBatchExecutionView, owner: Any) -> torch.Tensor:
     """Bind selected tokens, positions and constraint prefixes for either cache layout."""
     state = owner.beam.state
     rows = owner.state_rows
-    step = m.decode_step
+    step = view.decode_step
     if step is None:
         raise ValueError("Asynchronous scheduling device binding requires Decode metadata")
     initialized, finished = state.is_initialized[rows], state.is_finished[rows]
@@ -198,7 +228,7 @@ def bind_beam_decode_state(m: GRStageMetadata, owner: Any) -> tuple[torch.Tensor
     dispatch_error = torch.where(mismatch, ERROR_DISPATCH_STATE, error)
     state.error_code[rows] = dispatch_error
     running = initialized & ~finished & (dispatch_error == 0)
-    width = BeamBatchExecutionView.from_stage_metadata(m).input_width
+    width = view.input_width
     mask = running[:, None] & state.active_mask[rows, :width]
     flat_mask = mask.reshape(-1)
     owner.execution_mask.copy_(flat_mask)
@@ -216,4 +246,4 @@ def bind_beam_decode_state(m: GRStageMetadata, owner: Any) -> tuple[torch.Tensor
             -1,
         )
     )
-    return running, width
+    return running

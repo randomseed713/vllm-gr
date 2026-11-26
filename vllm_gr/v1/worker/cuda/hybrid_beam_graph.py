@@ -35,12 +35,17 @@ class GroupedDecodeGraphInputs:
             zip(worker.kv_cache_config.kv_cache_groups, kernel_block_sizes(worker), strict=True)
         ):
             spec = hybrid_group_spec(group)
-            if isinstance(spec, MambaSpec):
-                self.state_ids[group_id] = torch.zeros(rows, dtype=torch.int32, device=device)
-                columns = 1 if spec.mamba_cache_mode == "none" else cdiv(max_len, spec.block_size)
-            else:
-                columns = cdiv(max_len, spec.block_size) * (spec.block_size // kernel_size)
-            tables.append(torch.zeros((rows, columns), dtype=torch.int32, device=device))
+            recurrent = isinstance(spec, MambaSpec)
+            columns = (
+                1
+                if recurrent
+                else cdiv(max_len, spec.block_size) * (spec.block_size // kernel_size)
+            )
+            table = torch.zeros((rows, columns), dtype=torch.int32, device=device)
+            tables.append(table)
+            if recurrent:
+                # The capture builds single-token Decode metadata at position zero.
+                self.state_ids[group_id] = table[:, 0]
         self.batch = HybridDecodeBatch(
             seq_lens=torch.ones(rows, dtype=torch.int32, device=device),
             seq_lens_cpu=torch.ones(rows, dtype=torch.int32),
@@ -60,11 +65,12 @@ class GroupedDecodeGraphInputs:
         for index, (target, source, slot, actual_slots) in enumerate(
             zip(self.batch.tables, batch.tables, self.batch.slots, batch.slots, strict=True)
         ):
+            if index in self.state_ids:
+                self.state_ids[index].copy_(source[:, 0])
+                continue
             target.zero_()
             target[:, : source.shape[1]].copy_(source)
             slot.copy_(actual_slots)
-            if index in self.state_ids:
-                self.state_ids[index].copy_(source[:, 0])
 
 
 def supports_grouped_decode_graph(worker: Any) -> bool:

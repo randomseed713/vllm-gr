@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
 from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
@@ -49,9 +50,17 @@ def test_v1_prefill_retains_native_state_until_output_completion() -> None:
     logits = torch.zeros((1, 4))
     state = SimpleNamespace(logits=logits)
     connector = object()
-    worker = SimpleNamespace(execute_model_state=state, kv_connector_output=connector)
+    request_ids = ("request",)
+    worker = SimpleNamespace(
+        execute_model_state=state,
+        kv_connector_output=connector,
+        input_batch=SimpleNamespace(req_ids=list(request_ids)),
+    )
+    scheduled = SimpleNamespace(
+        **{GR_STAGE_OUTPUT_ATTR: {"request": SimpleNamespace(request_ids=request_ids)}}
+    )
     hooks = CudaStageHooksV1(worker)
-    assert hooks.prefill_logits(Mock(return_value=None), object()) is logits
+    assert hooks.prefill_logits(Mock(return_value=None), scheduled) is logits
     assert worker.execute_model_state is state
     assert worker.kv_connector_output is connector
     hooks.finish_native_output()
