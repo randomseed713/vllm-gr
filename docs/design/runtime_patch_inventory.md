@@ -122,8 +122,10 @@ Installer: `vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch`
 Risk: `critical`; process roles: `engine_core`
 
 Hybrid Beam reserves native cache blocks per request and group, and leases
-the prompt and private blocks until the Worker release. In aligned mode
-the schedule wrapper scopes native Mamba checkpoint splitting to partial
+the prompt and private blocks until the Worker release. The schedule wrapper
+defers the entire batch when free blocks and live blocks held by the session
+fall short of its Prefill admission budget. In aligned mode the wrapper
+scopes native Mamba checkpoint splitting to partial
 Prefill dispatches and keeps recurrent Decode capacity free through Prefill.
 It defers native `KVCacheCoordinator.cache_blocks` calls until all members of
 the final Prefill have been scheduled. When a running member can move a

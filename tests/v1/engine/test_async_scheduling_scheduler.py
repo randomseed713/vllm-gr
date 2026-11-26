@@ -585,6 +585,59 @@ def test_grouped_mamba_prefill_uses_completed_prefixes(
 
 @pytest.mark.l2
 @pytest.mark.parametrize("scheduler", [True], indirect=True)
+@pytest.mark.parametrize(
+    ("prompt_tokens", "hash_block_size", "num_blocks"),
+    [pytest.param(8, 16, 21, id="cold"), pytest.param(12, 8, 27, id="after-checkpoint")],
+)
+def test_hybrid_prefill_waits_for_whole_batch_capacity(
+    scheduler, prompt_tokens, hash_block_size, num_blocks
+):
+    hybrid = _make_hybrid_scheduler(
+        scheduler, hash_block_size=hash_block_size, internal_checkpoint=False, num_blocks=num_blocks
+    )
+    batch, requests = _make_hybrid_requests(prompt_tokens, hash_block_size)
+    for request in requests:
+        hybrid.add_request(request)
+    session = hybrid._gr_v1_sessions[batch.batch_id]
+
+    if hybrid.mamba_partial_cache_hit:
+        checkpoint = hybrid.schedule()
+        assert checkpoint.num_scheduled_tokens == {batch.batch_id: hash_block_size}
+        hybrid.update_from_output(
+            checkpoint,
+            ModelRunnerOutput(
+                req_ids=[batch.batch_id],
+                req_id_to_index={batch.batch_id: 0},
+                sampled_token_ids=[[]],
+            ),
+        )
+
+    # These pools fit the full batch with no room for an unrelated lease.
+    pool = hybrid.kv_cache_manager.block_pool
+    held = pool.get_new_blocks(1)
+    free = pool.get_num_free_blocks()
+    progress = [request.num_computed_tokens for request in requests]
+    for _ in range(len(requests) + 1):
+        assert hybrid.schedule().total_num_scheduled_tokens == 0
+        assert [request.num_computed_tokens for request in requests] == progress
+        assert pool.get_num_free_blocks() == free
+    assert not session._hybrid_prefill_ready
+
+    pool.free_blocks(held)
+    for _ in requests:
+        assert hybrid.schedule().total_num_scheduled_tokens == 0
+    request_ids = {request.request_id for request in requests}
+    for stage_index in range(batch.beam_params.max_tokens):
+        output = hybrid.schedule()
+        assert set(output.num_scheduled_tokens) == request_ids
+        assert output.gr_stage_metadata[batch.batch_id].stage_index == stage_index
+        hybrid.update_from_output(output, receipt(output))
+    assert session.resource_status is GRResourceStatus.CLOSED
+    assert pool.get_num_free_blocks() == num_blocks - 1
+
+
+@pytest.mark.l2
+@pytest.mark.parametrize("scheduler", [True], indirect=True)
 def test_hybrid_decode_tail_copy_rejects_insufficient_capacity(scheduler):
     hybrid = _make_hybrid_scheduler(
         scheduler, hash_block_size=8, internal_checkpoint=False, num_blocks=21

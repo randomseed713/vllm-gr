@@ -323,6 +323,8 @@ def build_hybrid_attention(
                 built.is_beam_decode = True
                 if group_id in graph_state_ids:
                     built.non_spec_state_indices_tensor = graph_state_ids[group_id]
+                    # Native calls can overwrite the builder's padded offsets.
+                    built.non_spec_query_start_loc = query
             attention.update(dict.fromkeys(attn_group.layer_names, built))
             slot_mappings.update(dict.fromkeys(attn_group.layer_names, slots))
     return attention, slot_mappings

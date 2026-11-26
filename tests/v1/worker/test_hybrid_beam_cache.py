@@ -4,9 +4,13 @@
 """Coverage for native Hybrid Beam admission and cache reparenting."""
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -24,8 +28,67 @@ from vllm_gr.v1.worker.cuda.hybrid_beam_cache import (
     _attention_decode_blocks,
     _recurrent_decode_blocks,
 )
+from vllm_gr.v1.worker.cuda.hybrid_beam_graph import GroupedDecodeGraphInputs
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.l1]
+
+
+def test_gdn_decode_graph_keeps_query_offsets_across_native_padding() -> None:
+    device = torch.device("cpu")
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE, max_cudagraph_capture_size=16
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=16),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        model_config=SimpleNamespace(max_model_len=64, hf_text_config=SimpleNamespace()),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        speculative_config=None,
+        additional_config={},
+    )
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((128,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    builder = GDNAttentionMetadataBuilder(spec, ["kda"], cast(VllmConfig, config), device)
+    worker = SimpleNamespace(
+        device=device,
+        model_config=config.model_config,
+        kernel_block_sizes=[16],
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[KVCacheGroupSpec(["kda"], spec)]),
+        attn_groups=[
+            [
+                SimpleNamespace(
+                    kv_cache_spec=spec, get_metadata_builder=lambda: builder, layer_names=["kda"]
+                )
+            ]
+        ],
+    )
+    captured = GroupedDecodeGraphInputs(worker, 8)
+    offsets = captured.attention["kda"].non_spec_query_start_loc
+    assert offsets.tolist() == list(range(9))
+
+    padded_offsets = torch.tensor([0, 1] + [2] * 15, dtype=torch.int32)
+    native = builder.build(
+        0,
+        CommonAttentionMetadata(
+            query_start_loc=padded_offsets,
+            query_start_loc_cpu=padded_offsets,
+            seq_lens=torch.ones(16, dtype=torch.int32),
+            num_reqs=16,
+            num_actual_tokens=16,
+            max_query_len=1,
+            max_seq_len=1,
+            block_table_tensor=torch.zeros((16, 1), dtype=torch.int32),
+            slot_mapping=torch.full((16,), -1, dtype=torch.int64),
+        ),
+    )
+    assert native.non_spec_query_start_loc is not None
+    assert torch.equal(native.non_spec_query_start_loc, padded_offsets)
+    assert offsets.tolist() == list(range(9))
 
 
 def test_hybrid_runtime_requires_native_cuda_cache_modes() -> None:

@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from itertools import islice
+from contextlib import contextmanager, nullcontext
+from itertools import chain, islice
 from typing import Any
 
 from vllm.utils.math_utils import cdiv
@@ -138,6 +138,30 @@ class _AdmissionQueue:
         return getattr(self.queue, name)
 
 
+def _has_hybrid_prefill_capacity(scheduler: Any, owner: GRSessionState) -> bool:
+    required = owner.hybrid_required_blocks
+    if not required or owner.issued_stages:
+        return True
+    manager = scheduler.kv_cache_manager
+    free = manager.block_pool.get_num_free_blocks()
+    if free >= required:
+        return True
+
+    # A checkpoint may already hold some of the batch's budget. Shared
+    # prefixes and their pins can reference the same physical block.
+    native_groups = (
+        group for request_id in owner.request_ids for group in manager.get_blocks(request_id).blocks
+    )
+    beam_groups = chain.from_iterable(owner._hybrid_beam_blocks)
+    owned_ids = {
+        block.block_id
+        for group in chain(native_groups, beam_groups, owner._hybrid_prefill_pinned)
+        for block in group
+        if not block.is_null and block.ref_cnt > 0
+    }
+    return free + len(owned_ids) >= required
+
+
 @contextmanager
 def gr_admission(scheduler: Any) -> Iterator[tuple[GRSessionState, str] | None]:
     """Gate native selection and reserve the full logical KV extent on first allocation."""
@@ -145,15 +169,22 @@ def gr_admission(scheduler: Any) -> Iterator[tuple[GRSessionState, str] | None]:
     if owner is None:
         yield None
         return
+    can_issue = can_issue_gr_stage(scheduler, owner) and _has_hybrid_prefill_capacity(
+        scheduler, owner
+    )
+    # Check capacity before the scope can park members or pin prefix hits.
+    scope = hybrid_prefill_scope(scheduler, owner) if can_issue else nullcontext()
     with (
-        hybrid_prefill_scope(scheduler, owner) as prefill_chunk,
-        _gr_admission(scheduler, owner, prefill_chunk),
+        scope as prefill_chunk,
+        _gr_admission(scheduler, owner, prefill_chunk, can_issue=can_issue),
     ):
         yield (owner, prefill_chunk) if prefill_chunk is not None else None
 
 
 @contextmanager
-def _gr_admission(scheduler: Any, owner: GRSessionState, prefill_chunk: str | None):
+def _gr_admission(
+    scheduler: Any, owner: GRSessionState, prefill_chunk: str | None, *, can_issue: bool
+):
     waiting, skipped = scheduler.waiting, scheduler.skipped_waiting
     budget = scheduler.max_num_scheduled_tokens
     manager = scheduler.kv_cache_manager
@@ -195,7 +226,7 @@ def _gr_admission(scheduler: Any, owner: GRSessionState, prefill_chunk: str | No
     scheduler.waiting = _AdmissionQueue(waiting, owner_ids)
     scheduler.skipped_waiting = _AdmissionQueue(skipped, owner_ids)
     manager.allocate_slots = reserve
-    if not can_issue_gr_stage(scheduler, owner):
+    if not can_issue:
         scheduler.max_num_scheduled_tokens = 0
     try:
         yield
@@ -362,6 +393,7 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
     except ValueError as error:
         raise GRAdmissionError(str(error)) from error
     branch_counts: tuple[tuple[int, ...], ...] = ()
+    hybrid_required_blocks = 0
     hybrid_decode_reserve = 0
     manager = getattr(scheduler, "kv_cache_manager", None)
     if manager is not None:
@@ -398,6 +430,7 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
             if len(engine_requests) > 1:
                 # Native admission applies the watermark to waiting siblings.
                 required_blocks += manager.watermark_blocks
+            hybrid_required_blocks = required_blocks
         else:
             required_blocks = sum(
                 cdiv(length + decode_steps, scheduler.cache_config.block_size)
@@ -427,6 +460,7 @@ def _prepare_gr_session(scheduler: Any, request: BeamBatchRequest) -> GRSessionS
         session_id=session_id,
         request=request,
         max_decode_steps=decode_steps,
+        hybrid_required_blocks=hybrid_required_blocks,
         hybrid_beam_block_counts=branch_counts,
         hybrid_decode_reserved_blocks=hybrid_decode_reserve,
     )

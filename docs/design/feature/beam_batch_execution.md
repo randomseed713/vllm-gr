@@ -73,8 +73,11 @@ self-attention with one token per cache state. See the
 supported layouts.
 
 The scheduler budgets private blocks for each request and cache group alongside
-native Prefill and Decode allocations. It keeps the original prompt blocks and
-private blocks leased until the Worker has drained and released the session.
+native Prefill and Decode allocations. Before each Prefill dispatch, it checks
+the full session budget against free blocks and distinct live blocks already
+held for the session. The whole batch waits when capacity falls short. The
+scheduler keeps the original prompt blocks and private blocks leased until the
+Worker has drained and released the session.
 
 With aligned recurrent prefix caching, native Prefill can schedule checkpoint
 chunks before the batch emits its first Beam token. Each partial dispatch uses
@@ -99,7 +102,8 @@ mode supports them. V2 uses the same GR token-bucket plan as OneRec to select
 a compatible Prefill graph. Model forward uses the shared GR Decode graph
 registry, startup capture and replay with fixed staging for group metadata.
 Full Decode graph bindings cover `GDN_ATTN` recurrent groups and `TRITON_MLA`
-attention groups. Other eligible cache groups use the eager Decode entry.
+attention groups. Each GDN capture owns its single-token query offsets and
+recurrent state indices. Other eligible cache groups use the eager Decode entry.
 Replay also requires `gr.beam_graph_enabled`, a configured batch shape and
 `enforce_eager=False`. Cache copies and Beam selection bracket the model graph.
 

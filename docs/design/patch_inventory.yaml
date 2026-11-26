@@ -177,12 +177,18 @@ patches:
     owner: vllm_gr/v1/core/sched/scheduler_patch.py and beam_async_scheduler.py
     shared_helpers: vllm_gr/v1/core/sched/beam_session.py, vllm_gr/v1/core/sched/hybrid_prefill.py, vllm_gr/v1/beam/dispatch.py, vllm_gr/v1/beam/hybrid_cache.py
     installer: vllm_gr.v1.core.sched.scheduler_patch.apply_scheduler_patch
-    activation: the EngineCore patch plan detects a missing schedule or update_from_output wrapper; when cache alignment is required, Hybrid Beam scopes native Mamba checkpoint splitting to partial Prefill and defers prefix publication during final grouped Prefill, preserving committed sources for fine-grained prefix hits
+    activation: >-
+      The EngineCore patch plan detects a missing schedule or update_from_output wrapper.
+      Hybrid Beam checks live KV capacity for the whole batch before Prefill.
+      When cache alignment is required, it scopes native Mamba checkpoint splitting
+      to partial Prefill and defers prefix publication during final grouped Prefill,
+      preserving committed sources for fine-grained prefix hits.
     validator_or_test:
       - vllm_gr.v1.core.sched.scheduler_patch.validate_scheduler_patch
       - tests/v1/engine/test_gr_async_scheduler.py
       - tests/v1/engine/test_gr_async_scheduler.py::test_hybrid_checkpoint_holds_native_blocks_until_cancel_drains
       - tests/v1/engine/test_async_scheduling_scheduler.py::test_grouped_mamba_prefill_uses_completed_prefixes
+      - tests/v1/engine/test_async_scheduling_scheduler.py::test_hybrid_prefill_waits_for_whole_batch_capacity
       - tests/v1/engine/test_async_scheduling_scheduler.py::test_hybrid_decode_tail_copy_rejects_insufficient_capacity
       - tests/v1/beam/test_beam_dispatch_session.py::test_hybrid_block_groups_stay_bound_to_the_session
       - tests/patch/test_patch_initialization.py::test_scheduler_plan_repairs_partial_install

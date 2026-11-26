@@ -66,6 +66,7 @@ class GRSessionState:
     owner_generation: int = 0
     retirement: GRRetireMetadata | None = None
     worker_resources_allocated: bool = False
+    hybrid_required_blocks: int = 0
     hybrid_beam_block_counts: tuple[tuple[int, ...], ...] = ()
     hybrid_decode_reserved_blocks: int = 0
     # EngineCore-private lifecycle state. These fields are excluded from the
