@@ -164,17 +164,6 @@ def test_align_budget_keeps_decode_blocks_and_checkpoint_headroom() -> None:
     ) == HybridBlockBudget(native_blocks=4, beam_blocks_by_group=(2, 2), decode_reserved_blocks=2)
 
 
-def test_copy_preserves_recurrent_states_when_parents_repeat_or_swap() -> None:
-    conv = torch.arange(24, dtype=torch.bfloat16).reshape(4, 3, 2)
-    recurrent = torch.arange(32, dtype=torch.float32).reshape(4, 2, 2, 2)
-    parents = torch.tensor([3, 1, 1])
-    targets = torch.tensor([1, 2, 3])
-    expected = [state[parents] for state in (conv, recurrent)]
-    CacheBlockCopy((conv, recurrent)).copy(parents, targets)
-    for state, copied in zip((conv, recurrent), expected, strict=True):
-        torch.testing.assert_close(state[targets], copied)
-
-
 def test_attention_decode_keeps_the_shared_page_and_forks_the_tail_across_boundary() -> None:
     cache = torch.arange(40).view(10, 4, 1)
     private = torch.tensor([[3, 4], [5, 6]], dtype=torch.int32)

@@ -119,14 +119,6 @@ class CudaStageHooksV2(CudaStageHooks):
         runtime = get_v2_runtime(worker)
         batch_size = len(owner.bindings)
         width = decode_width(owner)
-        if getattr(owner, "cache_group_batch", None) is not None:
-            from vllm_gr.v1.worker.cuda.hybrid_beam_graph import (
-                supports_grouped_decode_graph,
-            )
-
-            if not supports_grouped_decode_graph(worker):
-                owner.graph = None
-                return owner._forward()
         cfg = _get_gr_config(worker)
         bucket = getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0)
         geometry = (batch_size, width, bucket) if bucket else (batch_size, width)

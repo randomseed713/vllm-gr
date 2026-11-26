@@ -148,14 +148,6 @@ class CudaStageHooksV1(CudaStageHooks):
 
         batch_size = len(owner.bindings)
         width = decode_width(owner)
-        if getattr(owner, "cache_group_batch", None) is not None:
-            from vllm_gr.v1.worker.cuda.hybrid_beam_graph import (
-                supports_grouped_decode_graph,
-            )
-
-            if not supports_grouped_decode_graph(worker):
-                owner.graph = None
-                return owner._forward()
         cfg = _get_gr_config(worker)
         if batch_size not in cfg.deployment.beam_batch_sizes or batch_size in getattr(
             worker, "_gr_decode_capture_failures", {}

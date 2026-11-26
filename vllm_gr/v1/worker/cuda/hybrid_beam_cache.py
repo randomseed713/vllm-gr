@@ -36,7 +36,6 @@ class HybridDecodeBatch:
 class CacheGroupBindings:
     """Per-session cache leases staged on the device for all Decode steps."""
 
-    key: tuple[str, int]
     prompts: tuple[tuple[torch.Tensor, ...], ...]
     branches: tuple[tuple[torch.Tensor, ...], ...]
 
@@ -55,7 +54,7 @@ class CacheGroupBindings:
         views = iter(ids.split([len(row) for row in rows]))
         prompts = tuple(tuple(next(views) for _ in row) for row in prompt_ids)
         branches = tuple(tuple(next(views).view(width, -1) for _ in row) for row in branch_ids)
-        return cls((metadata.session_id, metadata.owner_generation), prompts, branches)
+        return cls(prompts, branches)
 
 
 def kernel_block_sizes(worker: Any) -> list[int]:
@@ -195,7 +194,7 @@ def prepare_hybrid_decode(
     width = view.input_width
     device = owner.beam.state.device
     binding = owner.cache_group_bindings
-    if binding is None or binding.key != (metadata.session_id, metadata.owner_generation):
+    if binding is None:
         binding = owner.cache_group_bindings = CacheGroupBindings.bind(
             metadata, device, view.beam_width
         )

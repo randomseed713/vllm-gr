@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -20,13 +19,17 @@ from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 pytestmark = [pytest.mark.gpu_test, pytest.mark.model_test, pytest.mark.l3, pytest.mark.slow_test]
 
 
-def _hybrid_model_options() -> dict[str, Any]:
+@pytest.fixture  # type: ignore[misc]
+def hybrid_model(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], Any, int]:
     if not torch.cuda.is_available():
         pytest.skip("Grouped Beam test requires CUDA")
     model = os.environ.get("VLLM_GR_TEST_HYBRID_MODEL")
     if not model:
         pytest.skip("Set VLLM_GR_TEST_HYBRID_MODEL to a local KDA/MLA checkpoint")
-    options: dict[str, Any] = {
+    from transformers import AutoConfig, AutoTokenizer
+
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    options = {
         "model": model,
         "trust_remote_code": True,
         "dtype": "bfloat16",
@@ -34,7 +37,48 @@ def _hybrid_model_options() -> dict[str, Any]:
         "gpu_memory_utilization": 0.65,
         "attention_config": {"backend": "TRITON_MLA"},
     }
-    return options
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    vocab_size = AutoConfig.from_pretrained(model, trust_remote_code=True).vocab_size
+    return options, tokenizer, vocab_size
+
+
+def _beam_config(
+    artifact: Path,
+    tokenizer: Any,
+    vocab_size: int,
+    width: int,
+    catalogs: Sequence[Sequence[tuple[int, ...]]],
+) -> dict[str, Any]:
+    from vllm_gr.constraints.artifact import save_constraint_table_artifact
+    from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler
+    from vllm_gr.constraints.json_compiler import compile_relations_json
+    from vllm_gr.constraints.tokenizer_digest import compute_tokenizer_digest
+
+    documents = [
+        compile_relations_json([tokenizer.convert_ids_to_tokens(sid) for sid in catalog])
+        for catalog in catalogs
+    ]
+    digest = compute_tokenizer_digest(tokenizer)
+    compiler = ConstraintTableArtifactCompiler(tokenizer, vocab_size, tokenizer_digest=digest)
+    table = (
+        compiler.compile(documents[0]) if len(documents) == 1 else compiler.compile_tries(documents)
+    )
+    return {
+        "beam_width": [width] * 3,
+        "candidate_width": [width] * 3,
+        "max_decode_steps": 3,
+        "constraint_mode": "table",
+        "constraint_table": {
+            "format": table.metadata.format,
+            "path": str(artifact),
+            "backend": "cuda",
+            "max_top_k": width,
+            "digests": {
+                "artifact": save_constraint_table_artifact(table, artifact),
+                "tokenizer": digest,
+            },
+        },
+    }
 
 
 class _ForcePrefix(AdapterLogitsProcessor):  # type: ignore[misc]
@@ -105,42 +149,22 @@ def _score_native_branches(
 
 @pytest.mark.timeout(1800)  # type: ignore[misc]
 def test_grouped_cuda_catalog_beam_matches_native(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hybrid_model: tuple[dict[str, Any], Any, int],
 ) -> None:
-    model_kwargs = _hybrid_model_options()
-    model_path = model_kwargs["model"]
-
-    from transformers import AutoTokenizer
     from vllm import LLM
     from vllm.inputs import TokensPrompt
 
-    from vllm_gr.constraints.artifact_builder import build_single_trie_artifact
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
 
+    model_kwargs, tokenizer, vocab_size = hybrid_model
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
-    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    # All beams branch from the same first token. Several second-token
-    # branches also have multiple terminal children.
+    # The first token is shared. Several second-token branches have multiple children.
     catalog = [(10, b, c) for b in range(20, 25) for c in range(30, 33)]
-    catalog_path = tmp_path / "catalog.json"
-    catalog_path.write_text(
-        json.dumps(
-            {
-                "triples": [
-                    dict(zip("abc", tokenizer.convert_ids_to_tokens(sid), strict=True))
-                    for sid in catalog
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    artifact = tmp_path / "table.safetensors"
-    artifact_digest, tokenizer_digest = build_single_trie_artifact(
-        Path(model_path), catalog_path, artifact
-    )
     width = 4
+    gr = _beam_config(tmp_path / "table.safetensors", tokenizer, vocab_size, width, [catalog])
     model_kwargs.update(
         enforce_eager=True,
         enable_prefix_caching=False,
@@ -153,19 +177,7 @@ def test_grouped_cuda_catalog_beam_matches_native(
     with GRLLM(
         **model_kwargs,
         async_scheduling=True,
-        gr={
-            "beam_width": [width] * 3,
-            "candidate_width": [width] * 3,
-            "max_decode_steps": 3,
-            "constraint_mode": "table",
-            "constraint_table": {
-                "format": "constraint_table_v1",
-                "path": str(artifact),
-                "backend": "cuda",
-                "max_top_k": width,
-                "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
-            },
-        },
+        gr=gr,
     ) as gr_llm:
         block_size = gr_llm.llm_engine.vllm_config.cache_config.block_size
         assert block_size > 2
@@ -185,12 +197,9 @@ def test_grouped_cuda_catalog_beam_matches_native(
     # Keep the oracle on an independent native engine with full logits.
     native = LLM(**model_kwargs, logprobs_mode="raw_logprobs", logits_processors=[_ForcePrefix])
     try:
-        expected_batches = [
-            _score_native_branches(native, prompt, catalog, width) for prompt in prompts
-        ]
-        for prompt, actual, expected in zip(prompts, observed, expected_batches, strict=True):
+        for prompt, actual in zip(prompts, observed, strict=True):
+            expected = _score_native_branches(native, prompt, catalog, width)
             print(f"Grouped Beam prompt_tokens={len(prompt)} results={actual} oracle={expected}")
-        for actual, expected in zip(observed, expected_batches, strict=True):
             assert actual[0][0] == expected[0][0]
             assert [score for _, score in actual] == sorted(
                 (score for _, score in actual), reverse=True
@@ -206,26 +215,19 @@ def test_grouped_cuda_catalog_beam_matches_native(
 @pytest.mark.parametrize("runner_v2", [False, True])  # type: ignore[misc]
 @pytest.mark.timeout(1800)  # type: ignore[misc]
 def test_grouped_cuda_batched_dynamic_trie_graph_and_prefix_cache(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner_v2: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_v2: bool,
+    hybrid_model: tuple[dict[str, Any], Any, int],
 ) -> None:
-    model_kwargs = _hybrid_model_options()
-    model = model_kwargs["model"]
-
-    from transformers import AutoConfig, AutoTokenizer
     from vllm.inputs import TokensPrompt
     from vllm.v1.metrics.reader import Counter
 
-    from vllm_gr.constraints.artifact import save_constraint_table_artifact
-    from vllm_gr.constraints.artifact_compiler import ConstraintTableArtifactCompiler
-    from vllm_gr.constraints.json_compiler import compile_relations_json
-    from vllm_gr.constraints.tokenizer_digest import compute_tokenizer_digest
     from vllm_gr.entrypoints.gr import GRLLM
     from vllm_gr.sampling_params import BeamSearchParams
 
+    model_kwargs, tokenizer, vocab_size = hybrid_model
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(runner_v2)))
-    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
     catalogs = [
         [
             (offset + a, offset + b, offset + c)
@@ -235,16 +237,9 @@ def test_grouped_cuda_batched_dynamic_trie_graph_and_prefix_cache(
         ]
         for offset in (0, 40)
     ]
-    trie_documents = [
-        compile_relations_json([tokenizer.convert_ids_to_tokens(sid) for sid in catalog])
-        for catalog in catalogs
-    ]
-    tokenizer_digest = compute_tokenizer_digest(tokenizer)
-    artifact = tmp_path / "multitrie.safetensors"
-    table = ConstraintTableArtifactCompiler(
-        tokenizer, model_config.vocab_size, tokenizer_digest=tokenizer_digest
-    ).compile_tries(trie_documents)
-    artifact_digest = save_constraint_table_artifact(table, artifact)
+    buckets = [32, 128, 512, 1024, 2048, 4096]
+    gr = _beam_config(tmp_path / "multitrie.safetensors", tokenizer, vocab_size, 8, catalogs)
+    gr.update(beam_batch_sizes=[1, 2], prefill_token_buckets=buckets)
     params = BeamSearchParams(
         beam_width=8,
         dynamic_beam_widths=[4, 6, 3],
@@ -266,23 +261,9 @@ def test_grouped_cuda_batched_dynamic_trie_graph_and_prefix_cache(
         disable_log_stats=False,
         compilation_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
-            "cudagraph_capture_sizes": [4, 16, 32, 128, 512, 1024, 2048, 4096],
+            "cudagraph_capture_sizes": [4, 16, *buckets],
         },
-        gr={
-            "beam_width": [8] * 3,
-            "beam_batch_sizes": [1, 2],
-            "prefill_token_buckets": [32, 128, 512, 1024, 2048, 4096],
-            "candidate_width": [8] * 3,
-            "max_decode_steps": 3,
-            "constraint_mode": "table",
-            "constraint_table": {
-                "format": "constraint_table_v2",
-                "path": str(artifact),
-                "backend": "cuda",
-                "max_top_k": 8,
-                "digests": {"artifact": artifact_digest, "tokenizer": tokenizer_digest},
-            },
-        },
+        gr=gr,
     ) as llm:
         block_size = llm.llm_engine.vllm_config.cache_config.block_size
         prompts = [

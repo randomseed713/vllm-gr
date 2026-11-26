@@ -10,7 +10,7 @@ from functools import wraps
 import torch
 from vllm.logger import init_logger
 
-from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
+from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR, GRStageKind
 from vllm_gr.v1.beam.execution_batch import (
     BeamBatchExecutionView,
     BeamExecutionContractError,
@@ -529,8 +529,30 @@ def make_patched_model_forward_gpu(_orig_model_forward):
     def patched_model_forward(self, input_ids=None, positions=None, *args, **kwargs):
         scheduler_output = getattr(self, "_current_scheduler_output", None)
         gr_stages = getattr(scheduler_output, GR_STAGE_OUTPUT_ATTR, None)
+        if is_hybrid_model(self):
+            # Grouped caches use the native Prefill graph and its metadata.
+            result = _orig_model_forward(self, input_ids, positions, *args, **kwargs)
+            if (
+                gr_stages
+                and len(gr_stages) == 1
+                and getattr(next(iter(gr_stages.values())), "kind", None) is GRStageKind.PREFILL
+                and not getattr(self.model_config, "enforce_eager", False)
+            ):
+                from vllm.forward_context import (
+                    get_forward_context,
+                    is_forward_context_available,
+                )
+
+                if is_forward_context_available():
+                    mode = get_forward_context().cudagraph_runtime_mode.name
+                    dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
+                    if dispatches is None:
+                        dispatches = self._gr_prefill_graph_dispatches = {}
+                    key = f"native:{mode}"
+                    dispatches[key] = dispatches.get(key, 0) + 1
+            return result
+
         batch_view = None
-        native_groups = is_hybrid_model(self)
         if gr_stages:
             # Decode uses its independent startup graph. A Batch Session has
             # exactly one stage descriptor whose request_ids define the
@@ -549,135 +571,121 @@ def make_patched_model_forward_gpu(_orig_model_forward):
             if getattr(self.model_config, "enforce_eager", False):
                 logger.debug("Prefill CUDA graph fallback: enforce_eager")
                 return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
-            if (
-                is_prefill_graph_enabled(self)
-                and not native_groups
-                and not hasattr(self, "_prefill_graph_runner")
-            ):
+            if is_prefill_graph_enabled(self) and not hasattr(self, "_prefill_graph_runner"):
                 logger.debug("Prefill CUDA graph fallback: runner_not_initialized")
                 return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
-        if (
-            scheduler_output is not None
-            and not native_groups
-            and (
-                is_prefill_graph_enabled(self)
-                and is_prefill_phase_batch(self, scheduler_output)
+        if scheduler_output is not None:
+            can_replay = is_prefill_graph_enabled(self) and is_prefill_phase_batch(
+                self, scheduler_output
+            )
+            if (
+                can_replay
                 # Dense-Prefill graphs replay only for fresh prompts.
                 and (
                     _get_gr_config(self).deployment.dense_prefill == "off"
                     or scheduled_requests_are_fresh(self, scheduler_output)
                 )
-            )
-        ):
-            raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
-            # The scheduler already computed the batch's token total; only
-            # the request count is derived here (the runner re-derives the
-            # per-request counts it needs from the dict itself).
-            if batch_view is not None:
-                if not isinstance(raw_scheduled_tokens, dict):
-                    logger.debug("Prefill CUDA graph fallback: batch_session_missing_request_ids")
-                    return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
-                try:
-                    batch_view.validate_request_order(tuple(raw_scheduled_tokens))
-                except BeamExecutionContractError:
-                    logger.debug("Prefill CUDA graph fallback: batch_session_request_order")
-                    return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
-            num_reqs = (
-                batch_view.batch_size if batch_view is not None else len(raw_scheduled_tokens)
-            )
-            total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
-            if not total_tokens and raw_scheduled_tokens:
-                total_tokens = (
-                    sum(raw_scheduled_tokens.values())
-                    if isinstance(raw_scheduled_tokens, dict)
-                    else sum(raw_scheduled_tokens)
+            ):
+                raw_scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", [])
+                # The scheduler already computed the batch's token total; only
+                # the request count is derived here (the runner re-derives the
+                # per-request counts it needs from the dict itself).
+                if batch_view is not None:
+                    if not isinstance(raw_scheduled_tokens, dict):
+                        logger.debug(
+                            "Prefill CUDA graph fallback: batch_session_missing_request_ids"
+                        )
+                        return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
+                    try:
+                        batch_view.validate_request_order(tuple(raw_scheduled_tokens))
+                    except BeamExecutionContractError:
+                        logger.debug("Prefill CUDA graph fallback: batch_session_request_order")
+                        return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
+                num_reqs = (
+                    batch_view.batch_size if batch_view is not None else len(raw_scheduled_tokens)
                 )
-
-            if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
-                p_runner = get_prefill_graph_runner(self)
-                bucket = p_runner.match_bucket(total_tokens)
-                reason = "no_matching_bucket" if bucket is None else "graph_not_captured"
-                # Native preprocessing may pad these 1D tensors to a
-                # compilation bucket. Only their scheduled prefix is
-                # live: the Prefill runner copies that prefix, preserves
-                # real Attention lengths, and masks its own padded KV
-                # slots. Native padding must not determine GR's bucket.
-                if gr_stages and (
-                    input_ids is None
-                    or input_ids.ndim != 1
-                    or input_ids.shape[0] < total_tokens
-                    or positions is None
-                    or tuple(positions.shape) != tuple(input_ids.shape)
-                    or kwargs.get("inputs_embeds") is not None
-                    or kwargs.get("intermediate_tensors") is not None
-                ):
-                    reason = "unsupported_inputs"
-                    bucket = None
-                if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
-                    # Extract slot mapping from active block table
-                    slot_mapping = None
-                    if (
-                        hasattr(self, "input_batch")
-                        and getattr(self.input_batch, "block_table", None) is not None
-                    ):
-                        try:
-                            blk_table = self.input_batch.block_table[0]
-                            if hasattr(blk_table, "slot_mapping") and hasattr(
-                                blk_table.slot_mapping, "gpu"
-                            ):
-                                slot_mapping = blk_table.slot_mapping.gpu
-                        except (AttributeError, IndexError, TypeError) as e:
-                            logger.warning("Could not get slot_mapping: %r", e)
-                    output_buf = p_runner.execute_model_prefill(
-                        bucket=bucket,
-                        input_ids=input_ids,
-                        positions=positions,
-                        slot_mapping=slot_mapping,
-                        num_scheduled_tokens=raw_scheduled_tokens,
+                total_tokens = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0)
+                if not total_tokens and raw_scheduled_tokens:
+                    total_tokens = (
+                        sum(raw_scheduled_tokens.values())
+                        if isinstance(raw_scheduled_tokens, dict)
+                        else sum(raw_scheduled_tokens)
                     )
 
-                    if output_buf is not None:
-                        dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
-                        if dispatches is None:
-                            dispatches = self._gr_prefill_graph_dispatches = {}
-                        key = f"replay:{num_reqs}"
-                        dispatches[key] = dispatches.get(key, 0) + 1
-                        logger.debug(
-                            "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
-                            "bucket=%s outcome=replay",
-                            total_tokens,
-                            num_reqs,
-                            bucket,
+                if 1 <= num_reqs <= SUPPORTED_NUM_REQS[-1] and total_tokens > 0:
+                    p_runner = get_prefill_graph_runner(self)
+                    bucket = p_runner.match_bucket(total_tokens)
+                    reason = "no_matching_bucket" if bucket is None else "graph_not_captured"
+                    if gr_stages:
+                        # Native preprocessing may pad these 1D tensors to a
+                        # compilation bucket. Only their scheduled prefix is
+                        # live: the Prefill runner copies that prefix, preserves
+                        # real Attention lengths, and masks its own padded KV
+                        # slots. Native padding must not determine GR's bucket.
+                        unsupported_inputs = (
+                            input_ids is None
+                            or input_ids.ndim != 1
+                            or input_ids.shape[0] < total_tokens
+                            or positions is None
+                            or tuple(positions.shape) != tuple(input_ids.shape)
+                            or kwargs.get("inputs_embeds") is not None
+                            or kwargs.get("intermediate_tensors") is not None
                         )
-                        return output_buf
-                    reason = getattr(p_runner, "last_replay_reason", "runner_rejected")
-                dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
-                if dispatches is None:
-                    dispatches = self._gr_prefill_graph_dispatches = {}
-                key = f"fallback:{num_reqs}:{reason}"
-                dispatches[key] = dispatches.get(key, 0) + 1
-                logger.debug(
-                    "Prefill CUDA graph dispatch: scheduled=%d requests=%d bucket=%s outcome=%s",
-                    total_tokens,
-                    num_reqs,
-                    bucket,
-                    reason,
-                )
-        result = _orig_model_forward(self, input_ids, positions, *args, **kwargs)
-        if batch_view is not None and native_groups:
-            from vllm.forward_context import (
-                get_forward_context,
-                is_forward_context_available,
-            )
+                        if unsupported_inputs:
+                            reason = "unsupported_inputs"
+                            bucket = None
+                    if bucket is not None and p_runner.has_captured_graph(bucket, num_reqs):
+                        # Extract slot mapping from active block table
+                        slot_mapping = None
+                        if (
+                            hasattr(self, "input_batch")
+                            and getattr(self.input_batch, "block_table", None) is not None
+                        ):
+                            try:
+                                blk_table = self.input_batch.block_table[0]
+                                if hasattr(blk_table, "slot_mapping") and hasattr(
+                                    blk_table.slot_mapping, "gpu"
+                                ):
+                                    slot_mapping = blk_table.slot_mapping.gpu
+                            except (AttributeError, IndexError, TypeError) as e:
+                                logger.warning("Could not get slot_mapping: %r", e)
+                        output_buf = p_runner.execute_model_prefill(
+                            bucket=bucket,
+                            input_ids=input_ids,
+                            positions=positions,
+                            slot_mapping=slot_mapping,
+                            num_scheduled_tokens=raw_scheduled_tokens,
+                        )
 
-            if is_forward_context_available():
-                mode = get_forward_context().cudagraph_runtime_mode.name
-                dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
-                if dispatches is None:
-                    dispatches = self._gr_prefill_graph_dispatches = {}
-                key = f"native:{mode}"
-                dispatches[key] = dispatches.get(key, 0) + 1
-        return result
+                        if output_buf is not None:
+                            dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
+                            if dispatches is None:
+                                dispatches = self._gr_prefill_graph_dispatches = {}
+                            key = f"replay:{num_reqs}"
+                            dispatches[key] = dispatches.get(key, 0) + 1
+                            logger.debug(
+                                "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
+                                "bucket=%s outcome=replay",
+                                total_tokens,
+                                num_reqs,
+                                bucket,
+                            )
+                            return output_buf
+                        reason = getattr(p_runner, "last_replay_reason", "runner_rejected")
+                    dispatches = getattr(self, "_gr_prefill_graph_dispatches", None)
+                    if dispatches is None:
+                        dispatches = self._gr_prefill_graph_dispatches = {}
+                    key = f"fallback:{num_reqs}:{reason}"
+                    dispatches[key] = dispatches.get(key, 0) + 1
+                    logger.debug(
+                        "Prefill CUDA graph dispatch: scheduled=%d requests=%d "
+                        "bucket=%s outcome=%s",
+                        total_tokens,
+                        num_reqs,
+                        bucket,
+                        reason,
+                    )
+        return _orig_model_forward(self, input_ids, positions, *args, **kwargs)
 
     setattr(patched_model_forward, _WORKER_MODEL_FORWARD_PATCH_MARKER, True)
     return patched_model_forward

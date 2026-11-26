@@ -163,7 +163,7 @@ For CUDA Hybrid Beam with prefix caching, set `enable-prefix-caching: true`,
 schedule recurrent checkpoints. With prefix caching disabled, use
 `mamba-cache-mode: none` and `enable-chunked-prefill: false`. The
 [Hybrid Beam example](../../examples/offline_inference/beam_search/README.md#run-hybrid-beam-on-cuda)
-shows the corresponding Python and serving settings.
+shows the corresponding Python settings.
 
 ### Batch sizes and token budgets
 

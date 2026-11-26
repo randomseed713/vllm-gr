@@ -992,6 +992,15 @@ class GPUBeamStageRunner:
                 if not self.uses_native_cache:
                     self._bind_attention(m)
                 self.prepare_decode(entry)
+                if self.uses_native_cache:
+                    from vllm_gr.v1.worker.cuda.hybrid_beam_graph import (
+                        supports_grouped_decode_graph,
+                    )
+
+                    if not supports_grouped_decode_graph(worker):
+                        self.graph = None
+                        self.logits = self._forward()
+                        continue
                 self.logits = self.hooks.decode_logits(self)
         return None
 
