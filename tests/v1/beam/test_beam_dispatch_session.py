@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 import msgspec
 import pytest

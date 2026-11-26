@@ -2,24 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-GR project
 """Shared GR configuration, context construction and graph diagnostics."""
 
-from typing import Any, cast
+from typing import Any
+
+from vllm_gr.config import GRConfig
 
 
-def _get_gr_config(runner: Any) -> Any:
-    """Return the worker's GRConfig, cached on the runner (frozen dataclass).
+def is_hybrid_model(runner: Any) -> bool:
+    return bool(getattr(getattr(runner, "model_config", None), "is_hybrid", False))
 
-    Configuration flows exclusively through the engine config chain
-    (CLI flags / additional_config -> GRConfig -> VllmConfig.additional_config);
-    no environment variables are consulted at runtime.
-    """
-    cached = getattr(runner, "_vllm_gr_config", None)
-    if cached is not None:
-        return cached
-    from vllm_gr.config import GRConfig
 
-    cfg = GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
-    runner._vllm_gr_config = cfg
-    return cfg
+def _get_gr_config(runner: Any) -> GRConfig:
+    return GRConfig.from_vllm_config(getattr(runner, "vllm_config", None))
 
 
 def _beam_full_graph_ready(runner: Any, num_tokens: int) -> bool:
@@ -33,7 +26,7 @@ def _beam_full_graph_ready(runner: Any, num_tokens: int) -> bool:
 
 def _beam_graph_enabled_for_run(runner: Any) -> bool:
     """Beam graphs are only used when the config enables them (GRConfig)."""
-    return cast(bool, _get_gr_config(runner).beam_graph_enabled)
+    return bool(_get_gr_config(runner).beam_graph_enabled)
 
 
 def get_beam_graph_runtime_stats(worker: Any) -> dict[str, Any]:
@@ -142,7 +135,7 @@ def _create_beam_context(runner: Any, gr_cfg: Any, max_batch: int = 1) -> Any:
 
     model_config = runner.model_config
     parallel_config = runner.parallel_config
-    use_native_cache = getattr(model_config, "is_hybrid", False)
+    use_native_cache = is_hybrid_model(runner)
 
     return BeamAttentionContext(
         max_batch=max_batch,

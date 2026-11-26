@@ -156,6 +156,10 @@ class GPUDynamicBeam:
 
 def discard_dynamic_graphs(worker: Any, context: Any) -> None:
     """Drain-time disposal before an adapter's captured buffers are replaced."""
+    if getattr(context, "use_native_cache", False):
+        # Group metadata uses graph-owned staging buffers. A new Beam width
+        # changes the graph key, independently of which session supplies it.
+        return
     graph = getattr(worker, "_beam_decode_graph", None)
     if graph is not None:
         graph.clear()

@@ -11,6 +11,7 @@ import torch
 from numpy.typing import NDArray
 
 from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR, GRStageKind
+from vllm_gr.v1.worker.gr_context import is_hybrid_model
 
 
 def try_prepare_gr_prefill_inputs(
@@ -33,7 +34,7 @@ def try_prepare_gr_prefill_inputs(
         return None
     if (
         runner.device.type != "cuda"
-        or getattr(getattr(runner, "model_config", None), "is_hybrid", False)
+        or is_hybrid_model(runner)
         # vLLM 0.30 represents all multi-dimensional RoPE through uses_mrope.
         or runner.uses_mrope
         or runner.enable_prompt_embeds

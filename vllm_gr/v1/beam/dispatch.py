@@ -34,6 +34,8 @@ GR_BATCH_RESULT_ATTR = "gr_batch_results"
 GR_RETIRE_OUTPUT_ATTR = "gr_retire_metadata"
 GR_RETIRE_RESULT_ATTR = "gr_retire_result"
 
+HybridBlockIdTable = tuple[tuple[tuple[int, ...], ...], ...]
+
 
 def validate_dispatch_request(request: BeamBatchRequest, *, trie_count: int | None = None) -> None:
     """Validate shared V1 semantics before native ADD or Worker allocation."""
@@ -170,10 +172,8 @@ class GRStageMetadata:
     session_init: BeamBatchRequest | None = None
     owner_generation: int = 0
     execution_capacity: GRExecutionCapacity | None = None
-    # One row of prompt block IDs per request_id, in the same order. GR
-    # execution supports one uniform KV cache group; for B=1 this retains
-    # the existing single-row representation used by V1 and V2 runners.
-    # None means block IDs were not published.
+    # Split attention publishes one prompt block row per request. Native
+    # grouped caches use the leased group tables below.
     kv_blocks: tuple[tuple[int, ...], ...] | None = None
     # The batch is formed by the caller and remains ordered and immutable for
     # the complete session. B=1 keeps the original representation.
@@ -181,8 +181,8 @@ class GRStageMetadata:
     num_prompt_tokens_by_request: tuple[int, ...] = ()
     # Hybrid block IDs follow request order, then native KV group order.
     # Both the private blocks and original Prefill blocks are leased until drain.
-    hybrid_beam_blocks: tuple[tuple[tuple[int, ...], ...], ...] | None = None
-    hybrid_prompt_blocks: tuple[tuple[tuple[int, ...], ...], ...] | None = None
+    hybrid_beam_blocks: HybridBlockIdTable | None = None
+    hybrid_prompt_blocks: HybridBlockIdTable | None = None
 
 
 @dataclass(frozen=True, slots=True)

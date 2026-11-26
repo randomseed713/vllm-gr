@@ -1018,7 +1018,7 @@ def test_hybrid_private_blocks_reserve_capacity_and_wait_for_retirement() -> Non
     pool = BlockPool(num_gpu_blocks=9, enable_caching=False, hash_block_size=16)
 
     def native_allocate(request: Any, num_new_tokens: int, **kwargs: Any) -> Any:
-        assert kwargs["reserved_blocks"] == 5
+        assert kwargs["reserved_blocks"] == 6
         assert kwargs["num_lookahead_tokens"] == 2
         assert pool.get_num_free_blocks() - kwargs["reserved_blocks"] >= 2
         return pool.get_new_blocks(2)
@@ -1028,6 +1028,7 @@ def test_hybrid_private_blocks_reserve_capacity_and_wait_for_retirement() -> Non
     )
     session = add_gr_session(scheduler, make_batch_request(3))
     session.hybrid_beam_block_counts = ((3, 2),)
+    session.hybrid_decode_reserved_blocks = 1
     request = scheduler.requests[session.session_id]
     request.num_computed_tokens = 0
     free = pool.get_num_free_blocks()
@@ -1058,9 +1059,9 @@ def test_hybrid_private_blocks_reserve_capacity_and_wait_for_retirement() -> Non
 
 @pytest.mark.l1
 def test_hybrid_checkpoint_holds_native_blocks_until_cancel_drains() -> None:
+    from vllm_gr.v1.core.sched.beam_async_scheduler import complete_hybrid_prefill_chunk
     from vllm_gr.v1.core.sched.hybrid_prefill import (
         attach_hybrid_prefill_chunk,
-        complete_hybrid_prefill_chunk,
         hybrid_prefill_scope,
     )
 
@@ -1089,7 +1090,7 @@ def test_hybrid_checkpoint_holds_native_blocks_until_cancel_drains() -> None:
     assert scheduler._mamba_block_aligned_split is native_split
 
     scheduled = _scheduler_output()
-    attach_hybrid_prefill_chunk(scheduler, scheduled, session.session_id)
+    attach_hybrid_prefill_chunk(scheduler, scheduled, session, session.session_id)
     assert block.ref_cnt == 2
     pool.free_blocks((block,))
     session.status = GRSessionStatus.ABORTED

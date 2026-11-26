@@ -26,6 +26,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm_gr.config.models import deployment_for
 from vllm_gr.v1.forward_context import fresh_prefill_capture
 from vllm_gr.v1.worker.cudagraph_capture import is_recoverable_capture_error
+from vllm_gr.v1.worker.gr_context import is_hybrid_model
 from vllm_gr.v1.worker.prefill_graph_common import (
     get_default_buckets,
     get_max_context_len,
@@ -139,6 +140,10 @@ class PrefillCapturePlan:
             sorted({size for size in get_gpu_prefill_buckets(runner) if 0 < size <= limit})
         )
         mode = manager.cudagraph_mode
+        # Native recurrent builders may only support uniform single-token
+        # FULL graphs. Use vLLM's resolved mixed mode for their Prefill.
+        if is_hybrid_model(runner):
+            mode = mode.mixed_mode()
         return cls(
             buckets,
             mode.has_full_cudagraphs(),

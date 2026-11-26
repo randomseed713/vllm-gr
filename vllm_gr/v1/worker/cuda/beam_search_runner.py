@@ -150,6 +150,8 @@ class BeamSearchRunner:
         self._session_reset: tuple[Any, ...] | None = None
         self._kv_capacity = context.max_decode_steps
         self._kv_grid: tuple[int] | None = None
+        self._kv_args: tuple[Any, ...] = ()
+        self._kv_kwargs: dict[str, Any] = {}
         if not getattr(context, "use_native_cache", False):
             self._bind_split_cache(context, session.slot, width)
 

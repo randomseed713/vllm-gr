@@ -17,10 +17,11 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_gr.config.execution import validate_gr_execution_runtime
-from vllm_gr.v1.beam.hybrid_cache import hybrid_block_budget
+from vllm_gr.ops.cuda.beam_kv_reorder import CacheBlockCopy
+from vllm_gr.v1.beam.hybrid_cache import HybridBlockBudget, hybrid_block_budget
 from vllm_gr.v1.worker.cuda.hybrid_beam_cache import (
+    CacheBlockPlan,
     _attention_decode_blocks,
-    _copy_blocks,
     _recurrent_decode_blocks,
 )
 
@@ -73,9 +74,15 @@ def test_hybrid_budget_includes_the_writable_tail_of_each_beam() -> None:
             ),
         ),
     ]
-    assert hybrid_block_budget(groups, prompt_tokens=7, decode_steps=2, beam_width=2) == (4, (4, 2))
-    assert hybrid_block_budget(groups, prompt_tokens=8, decode_steps=2, beam_width=2) == (4, (2, 2))
-    assert hybrid_block_budget(groups, prompt_tokens=7, decode_steps=0, beam_width=2) == (3, (0, 0))
+    assert hybrid_block_budget(
+        groups, prompt_tokens=7, decode_steps=2, beam_width=2
+    ) == HybridBlockBudget(native_blocks=4, beam_blocks_by_group=(4, 2), decode_reserved_blocks=0)
+    assert hybrid_block_budget(
+        groups, prompt_tokens=8, decode_steps=2, beam_width=2
+    ) == HybridBlockBudget(native_blocks=4, beam_blocks_by_group=(2, 2), decode_reserved_blocks=0)
+    assert hybrid_block_budget(
+        groups, prompt_tokens=7, decode_steps=0, beam_width=2
+    ) == HybridBlockBudget(native_blocks=3, beam_blocks_by_group=(0, 0), decode_reserved_blocks=0)
 
 
 @pytest.mark.parametrize(  # type: ignore[misc]
@@ -108,20 +115,53 @@ def test_hybrid_budget_accepts_native_recurrent_groups_with_paged_attention(
             UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs={"recurrent": spec}),
         ),
     ]
-    assert hybrid_block_budget(groups, prompt_tokens=7, decode_steps=2, beam_width=2) == (6, (4, 2))
+    assert hybrid_block_budget(
+        groups, prompt_tokens=7, decode_steps=2, beam_width=2
+    ) == HybridBlockBudget(native_blocks=6, beam_blocks_by_group=(4, 2), decode_reserved_blocks=1)
     cache = torch.arange(40).reshape(10, 4)
     private = torch.tensor([[6], [7]], dtype=torch.int32)
+    plan = CacheBlockPlan()
     table = _recurrent_decode_blocks(
-        ((cache,),),
-        [0, 3],
+        plan,
+        torch.tensor([0, 3], dtype=torch.int32),
         private,
         torch.zeros(2, dtype=torch.long),
         prompt_length=7,
         step=0,
         spec=spec,
     )
+    plan.apply(CacheBlockCopy((cache,)))
     assert table.tolist() == [[6, 6], [7, 7]]
     torch.testing.assert_close(cache[6:8], cache[3].expand(2, -1))
+
+
+def test_align_budget_keeps_decode_blocks_and_checkpoint_headroom() -> None:
+    groups = [
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float16),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((1024,),),
+                dtypes=(torch.float16,),
+                mamba_cache_mode="align",
+                num_prefill_checkpoint_blocks=1,
+                prefill_checkpoint_alignment=8,
+            ),
+        ),
+    ]
+    result = hybrid_block_budget(
+        groups, prompt_tokens=31, decode_steps=2, beam_width=2, hash_block_size=8
+    )
+    assert result == HybridBlockBudget(
+        native_blocks=10, beam_blocks_by_group=(4, 2), decode_reserved_blocks=1
+    )
+    assert hybrid_block_budget(
+        groups, prompt_tokens=8, decode_steps=2, beam_width=2, hash_block_size=8
+    ) == HybridBlockBudget(native_blocks=4, beam_blocks_by_group=(2, 2), decode_reserved_blocks=2)
 
 
 def test_copy_preserves_recurrent_states_when_parents_repeat_or_swap() -> None:
@@ -130,7 +170,7 @@ def test_copy_preserves_recurrent_states_when_parents_repeat_or_swap() -> None:
     parents = torch.tensor([3, 1, 1])
     targets = torch.tensor([1, 2, 3])
     expected = [state[parents] for state in (conv, recurrent)]
-    _copy_blocks((conv, recurrent), parents, targets)
+    CacheBlockCopy((conv, recurrent)).copy(parents, targets)
     for state, copied in zip((conv, recurrent), expected, strict=True):
         torch.testing.assert_close(state[targets], copied)
 
@@ -140,9 +180,18 @@ def test_attention_decode_keeps_the_shared_page_and_forks_the_tail_across_bounda
     private = torch.tensor([[3, 4], [5, 6]], dtype=torch.int32)
     prompt_cache = cache[1:3].clone()
     parents = torch.tensor([0, 0])
+    copier = CacheBlockCopy((cache,))
+    plan = CacheBlockPlan()
     table, slots = _attention_decode_blocks(
-        (cache,), [1, 2], private, parents, block_size=4, prompt_length=7, step=0
+        plan,
+        torch.tensor([1, 2], dtype=torch.int32),
+        private,
+        parents,
+        block_size=4,
+        prompt_length=7,
+        step=0,
     )
+    plan.apply(copier)
     assert table.tolist() == [[1, 3, 4], [1, 5, 6]]
     assert slots.tolist() == [15, 23]
     torch.testing.assert_close(cache[3], prompt_cache[1])
@@ -150,9 +199,17 @@ def test_attention_decode_keeps_the_shared_page_and_forks_the_tail_across_bounda
     cache[3, 3] = 80
     cache[5, 3] = 90
 
+    plan = CacheBlockPlan()
     _, slots = _attention_decode_blocks(
-        (cache,), [1, 2], private, torch.tensor([1, 1]), block_size=4, prompt_length=7, step=1
+        plan,
+        torch.tensor([1, 2], dtype=torch.int32),
+        private,
+        torch.tensor([1, 1]),
+        block_size=4,
+        prompt_length=7,
+        step=1,
     )
+    plan.apply(copier)
     assert slots.tolist() == [16, 24]
     assert cache[3, 3].item() == cache[5, 3].item() == 90
     assert not cache[[4, 6]].any()

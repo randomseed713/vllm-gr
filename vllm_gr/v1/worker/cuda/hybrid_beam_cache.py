@@ -5,15 +5,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
+from vllm_gr.ops.cuda.beam_kv_reorder import CacheBlockCopy
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
 from vllm_gr.v1.beam.hybrid_cache import hybrid_block_budget, hybrid_group_spec
 from vllm_gr.v1.worker.cuda.gr_inputs import bind_beam_decode_state
@@ -31,16 +32,44 @@ class HybridDecodeBatch:
     slots: tuple[torch.Tensor, ...]
 
 
-def _kernel_block_sizes(worker: Any) -> list[int]:
+@dataclass(slots=True)
+class CacheGroupBindings:
+    """Per-session cache leases staged on the device for all Decode steps."""
+
+    key: tuple[str, int]
+    prompts: tuple[tuple[torch.Tensor, ...], ...]
+    branches: tuple[tuple[torch.Tensor, ...], ...]
+
+    @classmethod
+    def bind(
+        cls, metadata: GRStageMetadata, device: torch.device, width: int
+    ) -> CacheGroupBindings:
+        prompt_ids = metadata.hybrid_prompt_blocks
+        branch_ids = metadata.hybrid_beam_blocks
+        if prompt_ids is None or branch_ids is None:
+            raise ValueError("Grouped Beam Decode requires leased cache blocks")
+        rows = [group for request in (*prompt_ids, *branch_ids) for group in request]
+        ids = async_tensor_h2d(
+            [block for row in rows for block in row], device=device, dtype=torch.int32
+        )
+        views = iter(ids.split([len(row) for row in rows]))
+        prompts = tuple(tuple(next(views) for _ in row) for row in prompt_ids)
+        branches = tuple(tuple(next(views).view(width, -1) for _ in row) for row in branch_ids)
+        return cls((metadata.session_id, metadata.owner_generation), prompts, branches)
+
+
+def kernel_block_sizes(worker: Any) -> list[int]:
     sizes = getattr(worker, "_kernel_block_sizes", None)
     return worker.kernel_block_sizes if sizes is None else sizes
 
 
-def validate_hybrid_cache(worker: Any, metadata: GRStageMetadata) -> None:
+def validate_hybrid_cache(
+    worker: Any, metadata: GRStageMetadata, *, for_startup_capture: bool = False
+) -> None:
     groups = worker.kv_cache_config.kv_cache_groups
     view = BeamBatchExecutionView.from_stage_metadata(metadata)
     steps = metadata.beam_params.max_tokens - 1
-    if steps:
+    if steps and not for_startup_capture:
         blocks = metadata.hybrid_beam_blocks
         prompt_blocks = metadata.hybrid_prompt_blocks
         if blocks is None or prompt_blocks is None:
@@ -48,16 +77,16 @@ def validate_hybrid_cache(worker: Any, metadata: GRStageMetadata) -> None:
         for length, private, prompt in zip(
             view.num_prompt_tokens_by_request, blocks, prompt_blocks, strict=True
         ):
-            _, expected = hybrid_block_budget(
+            budget = hybrid_block_budget(
                 groups, prompt_tokens=length, decode_steps=steps, beam_width=view.beam_width
             )
-            if tuple(map(len, private)) != expected or any(
+            if tuple(map(len, private)) != budget.beam_blocks_by_group or any(
                 i >= worker.kv_cache_config.num_blocks
                 for group in (*private, *prompt)
                 for i in group
             ):
                 raise ValueError("Hybrid Beam dispatch has incompatible cache blocks")
-    for group, kernel_size in zip(groups, _kernel_block_sizes(worker), strict=True):
+    for group, kernel_size in zip(groups, kernel_block_sizes(worker), strict=True):
         spec = hybrid_group_spec(group)
         if isinstance(spec, AttentionSpec) and spec.block_size % kernel_size:
             raise ValueError(
@@ -65,13 +94,25 @@ def validate_hybrid_cache(worker: Any, metadata: GRStageMetadata) -> None:
             )
 
 
-def _copy_blocks(
-    tensors: Iterable[torch.Tensor], source: torch.Tensor, destination: torch.Tensor
-) -> None:
-    # Snapshot each layer's sources before writing any destinations. Parents
-    # can repeat or swap positions across the same set of physical blocks.
-    for tensor in {tensor.data_ptr(): tensor for tensor in tensors}.values():
-        tensor.index_copy_(0, destination, tensor.index_select(0, source))
+@dataclass
+class CacheBlockPlan:
+    sources: list[torch.Tensor] = field(default_factory=list)
+    destinations: list[torch.Tensor] = field(default_factory=list)
+    empty_pages: list[torch.Tensor] = field(default_factory=list)
+
+    def copy(self, source: torch.Tensor, destination: torch.Tensor) -> None:
+        self.sources.append(source)
+        self.destinations.append(destination)
+
+    def apply(self, cache: CacheBlockCopy) -> None:
+        if self.sources:
+            cache.copy(_join(self.sources), _join(self.destinations))
+        if self.empty_pages:
+            cache.clear(_join(self.empty_pages))
+
+
+def _join(rows: list[torch.Tensor]) -> torch.Tensor:
+    return rows[0] if len(rows) == 1 else torch.cat(rows)
 
 
 def _kernel_blocks(ids: torch.Tensor, fragments: int) -> torch.Tensor:
@@ -82,8 +123,8 @@ def _kernel_blocks(ids: torch.Tensor, fragments: int) -> torch.Tensor:
 
 
 def _attention_decode_blocks(
-    caches: tuple[torch.Tensor, ...],
-    native_ids: Sequence[int],
+    plan: CacheBlockPlan,
+    native_ids: torch.Tensor,
     private_blocks: torch.Tensor,
     parents: torch.Tensor,
     *,
@@ -101,26 +142,23 @@ def _attention_decode_blocks(
         sources = (
             private_blocks.index_select(0, parents)[:, :preceding_pages].reshape(-1).long()
             if step
-            else torch.full_like(destinations, native_ids[shared_pages])
+            else native_ids[shared_pages].long().expand_as(destinations)
         )
-        _copy_blocks(
-            caches, _kernel_blocks(sources, fragments), _kernel_blocks(destinations, fragments)
-        )
+        plan.copy(_kernel_blocks(sources, fragments), _kernel_blocks(destinations, fragments))
 
     page, offset = divmod(relative_pos, block_size)
     write_blocks = live[:, page].long()
     if not offset:
-        for cache in caches:
-            cache.index_fill_(0, _kernel_blocks(write_blocks, fragments), 0)
+        plan.empty_pages.append(_kernel_blocks(write_blocks, fragments))
 
-    shared = private_blocks.new_tensor(list(native_ids[:shared_pages])).expand(parents.numel(), -1)
+    shared = native_ids[:shared_pages].expand(parents.numel(), -1)
     table = _kernel_blocks(torch.cat((shared, live), dim=1), fragments)
     return table, write_blocks * block_size + offset
 
 
 def _recurrent_decode_blocks(
-    caches: tuple[tuple[torch.Tensor, ...], ...],
-    native_ids: Sequence[int],
+    plan: CacheBlockPlan,
+    native_ids: torch.Tensor,
     private_blocks: torch.Tensor,
     parents: torch.Tensor,
     *,
@@ -135,9 +173,9 @@ def _recurrent_decode_blocks(
     sources = (
         private_blocks.flatten().long().index_select(0, parents)
         if step
-        else torch.full_like(targets, native_ids[initial])
+        else native_ids[initial].long().expand_as(targets)
     )
-    _copy_blocks((state for layer_states in caches for state in layer_states), sources, targets)
+    plan.copy(sources, targets)
     if spec.mamba_cache_mode == "align":
         # The native builder indexes by context length. Each beam keeps a
         # single recurrent state throughout Decode, including page boundaries.
@@ -151,16 +189,22 @@ def prepare_hybrid_decode(
     """Fork native caches using device-resident Beam parents and build native metadata."""
     worker = owner.worker
     step = metadata.decode_step
-    blocks = metadata.hybrid_beam_blocks
-    prompt_blocks = metadata.hybrid_prompt_blocks
-    if step is None or blocks is None or prompt_blocks is None:
-        raise ValueError("Hybrid Beam Decode requires native cache block IDs")
+    if step is None:
+        raise ValueError("Grouped Beam cache binding requires a Decode step")
     view = BeamBatchExecutionView.from_stage_metadata(metadata)
     width = view.input_width
     device = owner.beam.state.device
-    lengths_cpu = torch.tensor(view.num_prompt_tokens_by_request, dtype=torch.int32)
-    lengths_cpu = (lengths_cpu + step + 1).repeat_interleave(width)
-    lengths = lengths_cpu.to(device)
+    binding = owner.cache_group_bindings
+    if binding is None or binding.key != (metadata.session_id, metadata.owner_generation):
+        binding = owner.cache_group_bindings = CacheGroupBindings.bind(
+            metadata, device, view.beam_width
+        )
+    lengths_cpu = torch.tensor(
+        [length + step + 1 for length in view.num_prompt_tokens_by_request for _ in range(width)],
+        dtype=torch.int32,
+        pin_memory=True,
+    )
+    lengths = lengths_cpu.to(device, non_blocking=True)
     owner.device_positions = lengths.long() - 1
     bind_beam_decode_state(metadata, owner)
 
@@ -169,24 +213,34 @@ def prepare_hybrid_decode(
     parents = owner.beam.state.parent_ids[: view.batch_size, :width]
     parents = parents.clamp(0, view.beam_width - 1).long()
     recurrent_slots = torch.full((width,), -1, dtype=torch.long, device=device)
-    layers = worker.compilation_config.static_forward_context
+    groups = worker.kv_cache_config.kv_cache_groups
+    if owner.cache_group_copies is None:
+        layers = worker.compilation_config.static_forward_context
+        caches = []
+        for group in groups:
+            views = [layers[name].kv_cache for name in group.layer_names]
+            tensors = (
+                [state for view in views for state in view]
+                if isinstance(hybrid_group_spec(group), MambaSpec)
+                else views
+            )
+            caches.append(CacheBlockCopy(tensors))
+        owner.cache_group_copies = tuple(caches)
     tables = []
     all_slots = []
     for group_id, (group, kernel_size) in enumerate(
-        zip(worker.kv_cache_config.kv_cache_groups, _kernel_block_sizes(worker), strict=True)
+        zip(groups, kernel_block_sizes(worker), strict=True)
     ):
         spec = hybrid_group_spec(group)
-        caches = tuple(layers[name].kv_cache for name in group.layer_names)
+        plan = CacheBlockPlan()
         member_tables = []
         member_slots = []
         for index, length in enumerate(view.num_prompt_tokens_by_request):
-            native_ids = prompt_blocks[index][group_id]
-            private_ids = blocks[index][group_id]
-            private = torch.tensor(private_ids, dtype=torch.int32, device=device)
-            private = private.view(view.beam_width, -1)
+            native_ids = binding.prompts[index][group_id]
+            private = binding.branches[index][group_id]
             if isinstance(spec, MambaSpec):
                 table = _recurrent_decode_blocks(
-                    caches,
+                    plan,
                     native_ids,
                     private,
                     parents[index],
@@ -197,7 +251,7 @@ def prepare_hybrid_decode(
                 slots = recurrent_slots
             else:
                 table, slots = _attention_decode_blocks(
-                    caches,
+                    plan,
                     native_ids,
                     private,
                     parents[index],
@@ -208,6 +262,7 @@ def prepare_hybrid_decode(
                 )
             member_tables.append(table)
             member_slots.append(slots)
+        plan.apply(owner.cache_group_copies[group_id])
         cols = max(table.shape[1] for table in member_tables)
         tables.append(
             torch.cat(

@@ -61,25 +61,47 @@ step.
 
 ### Hybrid CUDA Decode
 
-Both CUDA ModelRunners use the decoder's native cache groups. The scheduler
-budgets private blocks for each request and cache group alongside the native
-Prefill and Decode allocations. It keeps the original prompt blocks and the
+OneRec and Hybrid decoders join the same GR session, Prefill, Decode and
+candidate selection flow. OneRec uses one native prompt cache group with the
+GR split-attention suffix pool. Hybrid decoders bind native payloads for each
+group and use the group's attention or recurrent backend. Eligible native
+cache groups use unquantized device-resident storage and
+expose per-layer views. Recurrent groups use `MambaSpec` with zero speculative
+blocks and `none` or `align` caching. Attention groups use paged decoder
+self-attention with one token per cache state. See the
+[cache group validator](../../../vllm_gr/v1/beam/hybrid_cache.py) for the
+supported layouts.
+
+The scheduler budgets private blocks for each request and cache group alongside
+native Prefill and Decode allocations. It keeps the original prompt blocks and
 private blocks leased until the Worker has drained and released the session.
 
 With aligned recurrent prefix caching, native Prefill can schedule checkpoint
 chunks before the batch emits its first Beam token. Each partial dispatch uses
-native scheduling and output bookkeeping. Once all prompts can finish, the
-scheduler dispatches their final chunks together and the Worker restores the
-logical request order before selecting candidates.
+native scheduling and output bookkeeping. The scheduler keeps the recurrent
+blocks needed by Decode available throughout Prefill. Once all prompts can
+finish, the scheduler dispatches their final chunks together and publishes
+new prefixes after all members have looked up existing prefixes. Fine-grained
+hits use the committed source from the start of the scheduling pass, so the
+Worker can copy each private tail before running the model. The Worker
+restores the logical request order before selecting candidates.
 
 Decode shares complete attention prompt pages. Each beam has private pages
 from the first writable position onward and one private state per recurrent
-cache group. The Worker copies states and writable page history using
-request-local parent indices, then invokes the native model with one token
-per row. It gathers all sources before writing destinations so repeated
-parents and parent swaps preserve the previous state. For eligible KDA/MLA
-batches, the model forward can replay a CUDA graph. Cache copies and Beam
-selection run outside that graph.
+group. GR uploads the leased block IDs once per session. The worker builds a
+device copy plan from request-local parent indices and batches dense block
+copies across requests and layers by layout. It gathers all sources before
+writing destinations so repeated parents and parent swaps preserve the
+previous state. Strided views use the same plan with tensor indexing.
+
+The GR Prefill stage can use native PIECEWISE graphs when the native mixed
+mode supports them. V2 uses the same GR token-bucket plan as OneRec to select
+a compatible Prefill graph. Model forward uses the shared GR Decode graph
+registry, startup capture and replay with fixed staging for group metadata.
+Full Decode graph bindings cover `GDN_ATTN` recurrent groups and `TRITON_MLA`
+attention groups. Other eligible cache groups use the eager Decode entry.
+Replay also requires `gr.beam_graph_enabled`, a configured batch shape and
+`enforce_eager=False`. Cache copies and Beam selection bracket the model graph.
 
 ### Validation boundaries
 
@@ -130,8 +152,9 @@ Prefill graph if its token bucket was captured. PIECEWISE uses the token
 bucket alone and can serve different admitted request counts.
 
 Size `max-num-seqs` for logical requests and `max-num-batched-tokens` for the
-Prefill workload. Ascend and Hybrid CUDA also use these budgets for the peak
-Decode row count. See the
+Prefill workload. Ascend also uses the token budget for peak Decode rows.
+Hybrid CUDA checks both budgets against its startup beam width and peak Decode
+rows. See the
 [batch and token budgets](../../configuration/README.md#batch-sizes-and-token-budgets)
 and [OneRec walkthrough](../../user_guide/onerec_quickstart.md).
 

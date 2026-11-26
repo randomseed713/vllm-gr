@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import Condition, Lock
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.cuda.streams import Event as CUDAEvent
@@ -85,6 +85,13 @@ from vllm_gr.v1.worker.cuda.gr_inputs import (
     PreparedGRInputs,
     bind_device_inputs,
 )
+
+if TYPE_CHECKING:
+    from vllm_gr.ops.cuda.beam_kv_reorder import CacheBlockCopy
+    from vllm_gr.v1.worker.cuda.hybrid_beam_cache import (
+        CacheGroupBindings,
+        HybridDecodeBatch,
+    )
 
 METADATA_ABI = 1
 _UNCONSTRAINED_HEAD_LAYOUT_LOCK = Lock()
@@ -257,6 +264,46 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
         )
         setattr(out, GR_WORKER_RESULT_ATTR, results)
         return out
+
+
+def decode_width(owner: GPUBeamStageRunner) -> int:
+    if owner.inputs is not None:
+        return owner.inputs.width
+    return int(owner.input_ids.numel()) // len(owner.bindings)
+
+
+def capture_decode_forward(
+    graph: Any, owner: GPUBeamStageRunner, *, persistent_install: bool
+) -> None:
+    """Use the shared graph registry with the cache layout's stable input views."""
+    if not getattr(owner, "uses_native_cache", False):
+        graph.capture(owner._forward_hidden, persistent_install=persistent_install)
+        return
+    if graph.ready:
+        return
+    from vllm_gr.v1.worker.cuda.hybrid_beam_graph import GroupedDecodeGraphInputs
+
+    inputs = GroupedDecodeGraphInputs(owner.worker, graph.signature.num_model_rows)
+
+    def forward(capture: bool) -> torch.Tensor:
+        return owner.hooks.forward_hidden(
+            inputs.input_ids, inputs.positions, inputs.attention, inputs.slots, capture
+        )
+
+    # Grouped replay uses the registry directly. Scope the capture wrapper so
+    # native Prefill retains the model wrapper and its graph dispatch.
+    graph.capture(forward, persistent_install=False)
+    graph.cache_group_inputs[graph.signature] = inputs
+
+
+def replay_decode_forward(graph: Any, owner: GPUBeamStageRunner) -> torch.Tensor | None:
+    batch = getattr(owner, "cache_group_batch", None)
+    if batch is not None:
+        from vllm.model_executor.offloader import get_offloader
+
+        graph.cache_group_inputs[graph.signature].load(owner, batch)
+        get_offloader().sync_prev_onload()
+    return _hidden_logits(owner, graph.replay())
 
 
 def should_replay_decode_graph(
@@ -557,6 +604,10 @@ class GPUBeamStageRunner:
         self.prepared: PreparedGRInputs | None = None
         self.final_output: GPUBeamFinalOutput
         self.metadata: Any = None
+        self.uses_native_cache = bool(getattr(beam.session.context, "use_native_cache", False))
+        self.cache_group_batch: HybridDecodeBatch | None = None
+        self.cache_group_bindings: CacheGroupBindings | None = None
+        self.cache_group_copies: tuple[CacheBlockCopy, ...] | None = None
         self.graph: Any = None
         self.logits: torch.Tensor | None = None
         batch_size = len(bindings)
@@ -758,6 +809,14 @@ class GPUBeamStageRunner:
 
     def prepare_decode(self, entry: BeamDispatchEntry) -> None:
         # Device binding has no dependency on Host output consumption.
+        if self.uses_native_cache:
+            from vllm_gr.v1.worker.cuda.hybrid_beam_cache import prepare_hybrid_decode
+
+            view = BeamBatchExecutionView.from_stage_metadata(entry.metadata)
+            if self.dynamic is not None:
+                self.dynamic.activate(view.input_width)
+            self.cache_group_batch = prepare_hybrid_decode(self, entry.metadata)
+            return
         prepared = self.prepared
         if prepared is None:
             raise RuntimeError(
@@ -782,12 +841,22 @@ class GPUBeamStageRunner:
         if bucket:
             assert self.inputs is not None
             graph.select(len(self.bindings), self.inputs.width, bucket)
-        graph.capture(self._forward_hidden, persistent_install=self.hooks.persistent_graph_install)
+        capture_decode_forward(graph, self, persistent_install=self.hooks.persistent_graph_install)
         return graph
 
     def _forward(self) -> torch.Tensor | None:
         """Eager Decode entry point; publishes hidden when the head is sliced."""
 
+        if self.cache_group_batch is not None:
+            from vllm_gr.v1.worker.cuda.hybrid_beam_cache import build_hybrid_attention
+
+            batch = self.cache_group_batch
+            self.attention, self.slot_mappings = build_hybrid_attention(
+                self.worker,
+                batch,
+                self.positions,
+                max_seq_len=int(batch.seq_lens_cpu.max()),
+            )
         return _hidden_logits(self, self._forward_hidden(False))
 
     def head_slice_cols(self, rows: int) -> int:
@@ -908,10 +977,9 @@ class GPUBeamStageRunner:
                 self.hidden = None
                 self.logits = self.hooks.prefill_logits(original, scheduler_output, *args, **kwargs)
             else:
-                native_cache = getattr(self.beam.session.context, "use_native_cache", False)
                 # Pure CPU work can run before the native Prefill staging fence.
                 assert self.pending is not None
-                if not native_cache:
+                if not self.uses_native_cache:
                     self.prepared = self.prepare_cpu(m, self.pending[1])
                 if previous_kind is GRStageKind.PREFILL:
                     # Native Prefill may asynchronously read reused CPU input
@@ -921,20 +989,10 @@ class GPUBeamStageRunner:
                 # Decode does not upload these native input buffers again, so
                 # subsequent Decode dispatches need no Host input-prep wait.
                 self.hooks.consume_native_state(scheduler_output)
-                if native_cache:
-                    from vllm_gr.v1.worker.cuda.hybrid_beam_graph import (
-                        hybrid_decode_logits,
-                    )
-
-                    if self.dynamic is not None:
-                        self.dynamic.activate(
-                            BeamBatchExecutionView.from_stage_metadata(m).input_width
-                        )
-                    self.logits = hybrid_decode_logits(self, m)
-                else:
+                if not self.uses_native_cache:
                     self._bind_attention(m)
-                    self.prepare_decode(entry)
-                    self.logits = self.hooks.decode_logits(self)
+                self.prepare_decode(entry)
+                self.logits = self.hooks.decode_logits(self)
         return None
 
     def sample(self, grammar_output: Any = None) -> AsyncGPUBeamOutput:
@@ -1174,6 +1232,7 @@ class GPUBeamStageRunner:
                 raise RuntimeError("GR release requires dispatch and output-consumer drain")
         torch.cuda.current_stream(self.beam.state.device).wait_event(self.last_work)
         self.beam.end_session(consumer_done=consumer_done)
+        self.cache_group_batch = self.cache_group_bindings = None
         # Keep fixed-address graph storage for compatible, fully drained reuse.
         self.closed = True
         self.beam.session.context._gr_execution_owner = None
@@ -1371,7 +1430,7 @@ def get_stage_runner(
         from vllm_gr.v1.worker.cuda.hybrid_beam_cache import validate_hybrid_cache
 
         validate_gr_execution_runtime(worker.vllm_config)
-        validate_hybrid_cache(worker, m)
+        validate_hybrid_cache(worker, m, for_startup_capture=for_startup_capture)
     else:
         _validate_split_cache(worker)
     if getattr(worker, "_beam_postprocess_workspaces", None) is None:

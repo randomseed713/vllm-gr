@@ -73,12 +73,13 @@ Scope: `core`; backend ID: `null`
 
 Owner: `vllm_gr/engine/arg_utils.py`
 
-Installer: `vllm_gr.engine.arg_utils.patch_add_cli_args`
+Installer: `vllm_gr.engine.arg_utils.patch_create_engine_config`
 
 Risk: `high`; process roles: `main`, `api_server`
 
-Hybrid Beam admission checks the CUDA configuration, native cache mode
-and expanded Decode row budget.
+Hybrid Beam startup checks the CUDA configuration, native cache mode and
+fixed beam width against the sequence and token budgets. Request admission
+checks the expanded Decode rows for each batch.
 
 ### GR-PATCH-007 — EngineCore Client and AsyncLLM Extensions
 
@@ -123,7 +124,12 @@ Risk: `critical`; process roles: `engine_core`
 Hybrid Beam reserves native cache blocks per request and group, and leases
 the prompt and private blocks until the Worker release. In aligned mode
 the schedule wrapper scopes native Mamba checkpoint splitting to partial
-Prefill dispatches. The update wrapper consumes their native receipts.
+Prefill dispatches and keeps recurrent Decode capacity free through Prefill.
+It defers native `KVCacheCoordinator.cache_blocks` calls until all members of
+the final Prefill have been scheduled. When a running member can move a
+fine-grained prefix entry during allocation, `KVCacheManager.get_computed_blocks`
+returns the committed source captured at the start of the schedule. The
+update wrapper consumes native partial Prefill receipts.
 
 ### GR-PATCH-022 — Prefix-cache hash memoization
 
@@ -145,9 +151,12 @@ Installer: `vllm_gr.v1.worker.model_runner_patch.apply_worker_patches`
 
 Risk: `critical`; process roles: `gpu_worker`
 
-For Hybrid Beam, both runners build per-group native metadata and copy the
-selected parent state into the Scheduler's private blocks before Decode.
-Graph-eligible KDA/MLA Decode uses fixed inputs for native state and KV slots.
+The CUDA stages bind either the split suffix pool or native cache groups
+before the shared Decode graph dispatch. For native groups, both runners
+batch parent-state copies into private leased blocks and stage group metadata
+in the common graph registry. The V2 Prefill graph manager selects compatible
+plans for both layouts using the native mixed-mode capability for grouped
+caches.
 
 ### GR-PATCH-012 — NPU ModelRunner Override
 

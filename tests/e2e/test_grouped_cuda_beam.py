@@ -20,26 +20,20 @@ from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 pytestmark = [pytest.mark.gpu_test, pytest.mark.model_test, pytest.mark.l3, pytest.mark.slow_test]
 
 
-def _kimi_model_options() -> dict[str, Any]:
+def _hybrid_model_options() -> dict[str, Any]:
     if not torch.cuda.is_available():
-        pytest.skip("Kimi Linear hybrid Beam test requires CUDA")
-    model = os.environ.get("VLLM_GR_TEST_KIMI_LINEAR_MODEL")
+        pytest.skip("Grouped Beam test requires CUDA")
+    model = os.environ.get("VLLM_GR_TEST_HYBRID_MODEL")
     if not model:
-        pytest.skip("Set VLLM_GR_TEST_KIMI_LINEAR_MODEL to a cached Kimi Linear 48B-A3B snapshot")
+        pytest.skip("Set VLLM_GR_TEST_HYBRID_MODEL to a local KDA/MLA checkpoint")
     options: dict[str, Any] = {
         "model": model,
         "trust_remote_code": True,
         "dtype": "bfloat16",
         "max_model_len": 2048,
-        "gpu_memory_utilization": 0.84,
+        "gpu_memory_utilization": 0.65,
         "attention_config": {"backend": "TRITON_MLA"},
     }
-    if os.environ.get("VLLM_GR_TEST_KIMI_LINEAR_CPU_OFFLOAD") == "1":
-        options.update(
-            offload_group_size=4,
-            offload_num_in_group=3,
-            offload_params={"w13_weight", "w2_weight"},
-        )
     return options
 
 
@@ -110,10 +104,10 @@ def _score_native_branches(
 
 
 @pytest.mark.timeout(1800)  # type: ignore[misc]
-def test_kimi_linear_catalog_beam_matches_native(
+def test_grouped_cuda_catalog_beam_matches_native(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    model_kwargs = _kimi_model_options()
+    model_kwargs = _hybrid_model_options()
     model_path = model_kwargs["model"]
 
     from transformers import AutoTokenizer
@@ -195,9 +189,7 @@ def test_kimi_linear_catalog_beam_matches_native(
             _score_native_branches(native, prompt, catalog, width) for prompt in prompts
         ]
         for prompt, actual, expected in zip(prompts, observed, expected_batches, strict=True):
-            print(
-                f"Kimi Linear hybrid Beam prompt_tokens={len(prompt)} results={actual} oracle={expected}"
-            )
+            print(f"Grouped Beam prompt_tokens={len(prompt)} results={actual} oracle={expected}")
         for actual, expected in zip(observed, expected_batches, strict=True):
             assert actual[0][0] == expected[0][0]
             assert [score for _, score in actual] == sorted(
@@ -213,10 +205,10 @@ def test_kimi_linear_catalog_beam_matches_native(
 
 @pytest.mark.parametrize("runner_v2", [False, True])  # type: ignore[misc]
 @pytest.mark.timeout(1800)  # type: ignore[misc]
-def test_kimi_linear_batched_dynamic_trie_graph_and_prefix_cache(
+def test_grouped_cuda_batched_dynamic_trie_graph_and_prefix_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner_v2: bool
 ) -> None:
-    model_kwargs = _kimi_model_options()
+    model_kwargs = _hybrid_model_options()
     model = model_kwargs["model"]
 
     from transformers import AutoConfig, AutoTokenizer
@@ -273,11 +265,13 @@ def test_kimi_linear_batched_dynamic_trie_graph_and_prefix_cache(
         max_num_seqs=16,
         disable_log_stats=False,
         compilation_config={
-            "cudagraph_mode": "FULL_DECODE_ONLY",
-            "cudagraph_capture_sizes": [1, 2, 4, 8, 12, 16],
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+            "cudagraph_capture_sizes": [4, 16, 32, 128, 512, 1024, 2048, 4096],
         },
         gr={
             "beam_width": [8] * 3,
+            "beam_batch_sizes": [1, 2],
+            "prefill_token_buckets": [32, 128, 512, 1024, 2048, 4096],
             "candidate_width": [8] * 3,
             "max_decode_steps": 3,
             "constraint_mode": "table",
@@ -315,4 +309,8 @@ def test_kimi_linear_batched_dynamic_trie_graph_and_prefix_cache(
         (stats,) = llm.collective_rpc("get_gr_beam_graph_runtime_stats")
         assert stats["full_dispatches"] == 4
         assert {8, 12}.issubset(stats["captured_widths"])
-        print(f"Kimi Linear dynamic CUDA graphs {stats} and prefix hits {cache_hits()}")
+        if runner_v2:
+            assert stats["prefill_graph_piecewise_dispatches"] == 2
+        else:
+            assert stats["gr_prefill_dispatches"]["native:PIECEWISE"] == 2
+        print(f"Grouped Beam CUDA graphs {stats} and prefix hits {cache_hits()}")

@@ -42,10 +42,12 @@ capture can fall back per shape after cleanup and a device-health check. Losing
 a graph recorded as successfully captured is an error. Profiled prefix-length
 buckets have a separate [capture policy](../feature/cuda_decode_attention.md#decode-graphs-and-fallback).
 
-Hybrid decoders use native per-group attention metadata in both runners.
-The KDA/MLA Decode graph binds live sequence lengths, cache slots and
-recurrent state IDs through fixed CUDA buffers. Native vLLM dispatch governs
-Hybrid Prefill. See [Hybrid CUDA Decode](../feature/beam_batch_execution.md#hybrid-cuda-decode).
+Cache groups supply the attention metadata for the shared Decode graph
+registry. Eligible `GDN_ATTN` and `TRITON_MLA` groups bind live sequence
+lengths, cache slots and recurrent state IDs through graph-owned CUDA buffers.
+V2 uses the GR Prefill capture plan for both split and grouped cache layouts.
+Native group builders use the resolved mixed-mode capability to select
+compatible Prefill graphs. See [Hybrid CUDA Decode](../feature/beam_batch_execution.md#hybrid-cuda-decode).
 
 ## Resource lifetime
 

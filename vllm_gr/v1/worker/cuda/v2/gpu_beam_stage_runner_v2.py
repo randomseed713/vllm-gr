@@ -39,7 +39,9 @@ from vllm_gr.v1.worker.cuda.beam_decode_graph import BeamDecodeCaptureUnsupporte
 from vllm_gr.v1.worker.cuda.gpu_beam_stage_runner import (
     BeamRequestBinding,
     GPUBeamStageRunner,
-    _hidden_logits,
+    capture_decode_forward,
+    decode_width,
+    replay_decode_forward,
     should_replay_decode_graph,
 )
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooks
@@ -109,7 +111,6 @@ class CudaStageHooksV2(CudaStageHooks):
         )
 
     def decode_logits(self, owner: GPUBeamStageRunner) -> torch.Tensor | None:
-        assert owner.inputs is not None
         from vllm_gr.v1.worker.gr_context import (
             _get_gr_config,
         )
@@ -117,11 +118,18 @@ class CudaStageHooksV2(CudaStageHooks):
         worker = self.worker
         runtime = get_v2_runtime(worker)
         batch_size = len(owner.bindings)
+        width = decode_width(owner)
+        if getattr(owner, "cache_group_batch", None) is not None:
+            from vllm_gr.v1.worker.cuda.hybrid_beam_graph import (
+                supports_grouped_decode_graph,
+            )
+
+            if not supports_grouped_decode_graph(worker):
+                owner.graph = None
+                return owner._forward()
         cfg = _get_gr_config(worker)
         bucket = getattr(getattr(owner, "metadata", None), "prefix_length_bucket", 0)
-        geometry = (
-            (batch_size, owner.inputs.width, bucket) if bucket else (batch_size, owner.inputs.width)
-        )
+        geometry = (batch_size, width, bucket) if bucket else (batch_size, width)
         if geometry in runtime.runtime_failures:
             owner.graph = None
             return owner._forward()
@@ -132,9 +140,9 @@ class CudaStageHooksV2(CudaStageHooks):
             and not runtime.capture_failed
             and batch_size not in (runtime.startup_failures or {})
         )
-        owner.graph = self.decode_graph(batch_size, owner.inputs.width) if enabled else None
+        owner.graph = self.decode_graph(batch_size, width) if enabled else None
         if owner.graph is not None and bucket:
-            owner.graph.select(batch_size, owner.inputs.width, bucket)
+            owner.graph.select(batch_size, width, bucket)
         # Dynamic sessions own per-width buffers. Rebuild after schedule/batch
         # changes, including the first fixed-width session following them.
         if (
@@ -143,7 +151,7 @@ class CudaStageHooksV2(CudaStageHooks):
             and (bucket or owner.dynamic is not None or runtime.graphs_discarded)
         ):
             try:
-                owner.graph.capture(owner._forward_hidden, persistent_install=False)
+                capture_decode_forward(owner.graph, owner, persistent_install=False)
             except BeamDecodeCaptureUnsupported as error:
                 # Capture has restored the model wrapper. Drain its side stream
                 # before reusing live request buffers; unhealthy devices must fail.
@@ -156,12 +164,12 @@ class CudaStageHooksV2(CudaStageHooks):
                 logger.warning(
                     "GR runtime Decode capture unsupported; using eager for B=%d W=%d: %s",
                     batch_size,
-                    owner.inputs.width,
+                    width,
                     error,
                 )
                 return owner._forward()
         if should_replay_decode_graph_v2(worker, owner.graph, batch_size=batch_size):
-            return _hidden_logits(owner, owner.graph.replay())
+            return replay_decode_forward(owner.graph, owner)
         return owner._forward()
 
     def consume_retirement_state(

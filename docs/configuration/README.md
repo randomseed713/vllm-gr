@@ -8,7 +8,7 @@ the upstream vLLM defaults.
 
 GR stores its resolved configuration in `additional_config["vllm_gr"]`.
 Supply settings through `gr=`, `--gr-config`, or the YAML `gr` section.
-EngineArgs resolves the settings on the driver before publishing a JSON-compatible
+The driver resolves the settings before publishing a JSON-compatible
 snapshot in the vLLM configuration. Step width lists determine the runtime
 capacities when present. A Python `GRConfig` can also describe pool and candidate
 capacities without setting request defaults. Its snapshot carries these scalar
@@ -152,11 +152,18 @@ for related features.
 
 ## Asynchronous scheduling
 
-Beam execution requires `async-scheduling: true` and
-`enable-chunked-prefill: false`. Both are packaged defaults. In Python the
-corresponding arguments are `async_scheduling=True` and
-`enable_chunked_prefill=False`. See the [CUDA walkthrough](../user_guide/onerec_quickstart.md)
-or the [Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-python-entry-point).
+Beam execution requires `async-scheduling: true` (`async_scheduling=True` in
+Python). For OneRec and other Beam paths without aligned recurrent caching,
+use the packaged `enable-chunked-prefill: false` default. See the
+[CUDA walkthrough](../user_guide/onerec_quickstart.md) or the
+[Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-python-entry-point).
+
+For CUDA Hybrid Beam with prefix caching, set `enable-prefix-caching: true`,
+`mamba-cache-mode: align` and `enable-chunked-prefill: true` so native vLLM can
+schedule recurrent checkpoints. With prefix caching disabled, use
+`mamba-cache-mode: none` and `enable-chunked-prefill: false`. The
+[Hybrid Beam example](../../examples/offline_inference/beam_search/README.md#run-hybrid-beam-on-cuda)
+shows the corresponding Python and serving settings.
 
 ### Batch sizes and token budgets
 
@@ -165,14 +172,18 @@ or the [Ascend Beam example](../user_guide/beam_search_npu.md#configuration-and-
   the maximum size. Separate HTTP requests are not combined to fill a batch.
   Both CUDA model runners use this list for Prefill and Decode graph capture.
   Ascend has separate Decode graph settings.
-- `max-num-seqs` must cover the number of prompts in the Beam batch. For
-  example, two prompts at width 128 count as two requests for this check.
+- `max-num-seqs` must cover the number of prompts in the Beam batch.
 - `max-num-batched-tokens` must cover the total prompt tokens at Prefill.
   With chunked prefill disabled, an omitted budget grows to cover
   `max-model-len`. An explicit budget goes through native validation.
-  On Ascend, a request with a Decode stage must also fit the batch size times
-  the peak input beam width for those stages. Two prompts at fixed width 128
-  therefore require capacity for at least 256 Decode rows.
+- On Ascend, the token budget must also fit the batch size times the largest
+  input beam width among Decode stages. Two prompts at fixed width 128
+  require at least 256 Decode rows.
+- For CUDA Hybrid Beam, both budgets must cover the engine's fixed startup
+  beam width and, for batches with Decode, the batch size times the largest
+  Decode input width. With startup width 8 and retained widths `[4, 6, 3]`,
+  two prompts require 12 Decode rows. One prompt requires a budget of at
+  least 8 to satisfy startup validation.
 
 ## Constraint table
 
@@ -189,3 +200,61 @@ gr:
 
 See [Constraint tables](constraint_tables.md) to build a single- or multi-Trie
 artifact, write `table.yaml` and select a catalog per prompt.
+
+### Native EngineArgs
+
+GR serve and `GRLLM(model=..., gr=..., config=...)` prepare native vLLM
+arguments and the JSON-compatible worker snapshot. The gRPC frontend consumes
+`gr.admin_host` and `gr.admin_port` before publication. Setting the port to
+`null` disables the management listener. Both the driver and workers reject
+these keys in `additional_config["vllm_gr"]`.
+
+When upgrading, GR serve and `GRLLM` rebuild the snapshot from your startup
+settings. If you saved the output of `gr_config_to_mapping()`, regenerate it
+from your source configuration. If only the saved JSON is available, remove
+`admin_host` and `admin_port` from its `gr` object, even if the port is
+`null`. To keep an enabled management listener, put its host and port in the
+`gr` section of the gRPC server's startup YAML.
+
+Direct callers of vLLM's `EngineArgs` or `AsyncEngineArgs` can publish a
+validated GR configuration using the native field. `load_gr_config()` reads
+the GR settings from `scenario.yaml`. Pass the native Beam settings to
+`AsyncEngineArgs` directly. With chunked prefill disabled, the token budget
+must cover the model length. Set `max_logprobs` to at least the effective
+candidate width so the first Beam request can be admitted. The packaged
+profile needs 128, above vLLM's default limit of 20. Set `model_path` to
+your local model directory.
+
+```python
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm_gr.config import gr_config_to_mapping, load_gr_config, resolve_candidate_width
+
+gr = load_gr_config("scenario.yaml")
+args = AsyncEngineArgs(
+    model=model_path,
+    async_scheduling=True,
+    enable_chunked_prefill=False,
+    max_model_len=4096,
+    max_num_batched_tokens=4096,
+    max_logprobs=resolve_candidate_width(gr),
+    additional_config={"vllm_gr": gr_config_to_mapping(gr)},
+)
+vllm_config = args.create_engine_config()
+```
+
+If you previously passed only `additional_config["vllm_gr_backend_options"]`,
+supply `additional_config["vllm_gr"]` alongside your backend options and set
+the native Beam arguments as shown above. This also applies to an empty options
+dictionary. GR serve and `GRLLM` can prepare both sets of defaults from a
+startup file.
+
+`GRLLM` also forwards a native vLLM `additional_config` object that implements
+`compute_hash()` when both `gr=` and `config=` are omitted. Explicit GR
+configuration requires a mapping to carry the GR snapshot.
+
+For NPU SID-stage vocabulary execution through this native API, set
+`gr.worker_decision: true` explicitly in the YAML passed to `load_gr_config()`,
+along with `gr.sid_stage_vocab: true`, `gr.constraint_mode: none` and
+`gr.max_decode_steps` of at most 3. The loader validates the GR settings before
+`AsyncEngineArgs` is constructed. GR serve and `GRLLM` supply the NPU
+provider's worker-decision default before that validation.

@@ -140,29 +140,51 @@ def test_core_hot_update_utility_contracts(monkeypatch: pytest.MonkeyPatch) -> N
     native_resume_call = Mock()
     monkeypatch.setattr(core, "pause_scheduler", native_pause_call)
     monkeypatch.setattr(core, "resume_scheduler", native_resume_call)
-    assert getattr(core, "pause")() is pending
+    assert core.pause() is pending
     native_pause_call.assert_called_once_with(mode="wait", clear_cache=True)
     assert not pending.done()
     pending.set_result(None)
-    assert getattr(core, "resume")() == {"ok": True}
+    assert core.resume() == {"ok": True}
     native_resume_call.assert_called_once_with()
 
 
 def test_scheduler_contracts() -> None:
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.core.sched.scheduler import Scheduler
 
     assert _parameter_names(Scheduler.schedule) == ["self", "throttle_prefills"]
     assert inspect.signature(Scheduler.schedule).parameters["throttle_prefills"].default is False
+    assert _parameter_names(HybridKVCacheCoordinator.cache_blocks) == [
+        "self",
+        "request",
+        "num_computed_tokens",
+    ]
+    assert _parameter_names(KVCacheManager.get_computed_blocks) == ["self", "request"]
+    assert (
+        inspect.signature(KVCacheManager.allocate_slots).parameters["reserved_blocks"].default == 0
+    )
     assert not hasattr(SchedulerOutput, "__slots__")
 
 
 def test_engine_args_descriptor_contracts() -> None:
-    from vllm.engine.arg_utils import EngineArgs
+    from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 
-    from vllm_gr.engine.arg_utils_gr import patch_add_cli_args
+    from vllm_gr.engine.arg_utils import (
+        create_engine_config,
+        patch_create_engine_config,
+    )
 
-    patch_add_cli_args()
+    patch_create_engine_config()
+    assert EngineArgs.create_engine_config is create_engine_config
+    for method in (
+        EngineArgs.__init__,
+        AsyncEngineArgs.__init__,
+        EngineArgs.add_cli_args,
+        EngineArgs.from_cli_args,
+    ):
+        assert method.__module__ == "vllm.engine.arg_utils"
     assert isinstance(inspect.getattr_static(EngineArgs, "add_cli_args"), staticmethod)
     assert EngineArgs.add_cli_args is object.__new__(EngineArgs).add_cli_args
     assert isinstance(inspect.getattr_static(EngineArgs, "from_cli_args"), classmethod)

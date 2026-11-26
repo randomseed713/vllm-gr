@@ -91,26 +91,33 @@ The same guide shows how to compile a persistent table for online serving.
 
 ## Run Hybrid Beam on CUDA
 
-`GRLLM.beam_search()` supports native Hybrid decoders with recurrent state
-and paged attention on CUDA ModelRunner V1 and V2. This example uses
-[Kimi Linear 48B-A3B](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct),
+`GRLLM.beam_search()` supports Hybrid decoders with eligible recurrent and
+paged attention cache groups on CUDA ModelRunner V1 and V2. Use a native
+attention backend and an unquantized KV cache. The validation model is
+[Ling-3.0-tiny](https://huggingface.co/inclusionAI/Ling-3.0-tiny),
 which combines Kimi Delta Attention (KDA) and Multi-Head Latent Attention (MLA).
-Use `TRITON_MLA` for KDA/MLA Beam Decode graphs. `mamba_cache_mode="align"`
-uses native prefix caching with chunked Prefill enabled. With prefix caching
-and chunked Prefill disabled, use `mamba_cache_mode="none"`.
+See the [cache and graph requirements](../../../docs/design/feature/beam_batch_execution.md#hybrid-cuda-decode).
 
-Set `max_num_seqs` and `max_num_batched_tokens` to cover the number of
-prompts times the largest Decode input width. The token budget must also
-cover the sum of the prompt lengths. For eager execution, set
-`enforce_eager=True`. Other native attention layouts can use eager Decode.
+For prefix caching, use `mamba_cache_mode="align"` and enable chunked Prefill.
+With prefix caching disabled, use `mamba_cache_mode="none"` and disable
+chunked Prefill. The example selects `TRITON_MLA` for Decode graph replay.
+Set `enforce_eager=True` for eager execution.
+
+Set `max_num_seqs` and `max_num_batched_tokens` to cover both the startup beam
+width and the number of prompts times the largest Decode input width. The
+sequence budget must cover the prompt count, and the token budget must cover
+the sum of the prompt lengths. See the
+[batch and token budgets](../../../docs/configuration/README.md#batch-sizes-and-token-budgets).
 
 For recommendation, use a checkpoint trained on your SID tokens. Set
-`KIMI_MODEL` to the trusted local checkpoint path, `SID_TRIPLES` to a triples
-JSON file, and `SID_PROMPT` to a UTF-8 prompt file. Each entry under `triples`
-uses `a`, `b`, and `c` keys with values from the checkpoint's tokenizer.
+`HYBRID_MODEL` to the trusted local checkpoint path, `SID_TRIPLES` to a
+[versioned triples JSON file](../../../docs/configuration/constraint_tables.md#build),
+and `SID_PROMPT` to a UTF-8 prompt file. Each entry under `triples` uses
+`a`, `b`, and `c` keys with values from the checkpoint's tokenizer.
 
 Save the following as `hybrid_beam.py` and run it with
-`VLLM_USE_V2_MODEL_RUNNER=1 python hybrid_beam.py`.
+`VLLM_USE_V2_MODEL_RUNNER=1 python hybrid_beam.py`. Set
+`VLLM_USE_V2_MODEL_RUNNER=0` to select V1.
 
 ```python
 import os
@@ -123,7 +130,7 @@ from vllm_gr.sampling_params import BeamSearchParams
 
 
 def main():
-    model = Path(os.environ["KIMI_MODEL"]).resolve()
+    model = Path(os.environ["HYBRID_MODEL"]).resolve()
     catalog = Path(os.environ["SID_TRIPLES"])
     prompt = Path(os.environ["SID_PROMPT"]).read_text(encoding="utf-8")
     width = 8
@@ -143,15 +150,14 @@ def main():
             max_model_len=2048,
             max_num_batched_tokens=4096,
             max_num_seqs=2 * width,
-            gpu_memory_utilization=0.84,
-            offload_group_size=4,
-            offload_num_in_group=3,
-            offload_params={"w13_weight", "w2_weight"},
+            gpu_memory_utilization=0.65,
             compilation_config={
-                "cudagraph_mode": "FULL_DECODE_ONLY",
-                "cudagraph_capture_sizes": [1, 2, 4, 8, 12, 16],
+                "cudagraph_mode": "FULL_AND_PIECEWISE",
+                "cudagraph_capture_sizes": [4, 32, 128, 512, 1024, 2048, 4096],
             },
             gr={
+                "beam_batch_sizes": [1, 2],
+                "prefill_token_buckets": [32, 128, 512, 1024, 2048, 4096],
                 "beam_width": [width] * 3,
                 "candidate_width": [width] * 3,
                 "max_decode_steps": 3,
@@ -186,18 +192,73 @@ if __name__ == "__main__":
     main()
 ```
 
-The offload options use the native vLLM prefetch offloader to fit the BF16
-weights on one 48 GB L20 with sufficient host RAM. If your accelerator can
-hold the weights, omit the three offload options. This example uses
-`FULL_DECODE_ONLY` to combine Decode graph replay with eager native Prefill.
+Beam requires TP, PP, DP, DCP and PCP sizes of 1. The BF16 Ling example
+runs on one NVIDIA L20 with resident weights. `FULL_AND_PIECEWISE` uses
+PIECEWISE Prefill and FULL Decode for the example's cache groups. Use
+`FULL_DECODE_ONLY` to run Prefill eagerly while retaining Decode replay.
 
 If your checkpoint uses SID boundary tokens, supply `begin_token` and
-`end_token` in `BeamSearchParams` and add their count to `max_tokens`.
+`end_token` in `BeamSearchParams`. With both markers, set `max_tokens=5` for
+three generated SID tokens and keep three entries in each width schedule.
 
-Use the same GR table and native cache settings with
-`vllm serve MODEL --gr` for [HTTP](../../../docs/serving/completions.md#request)
-or add `--grpc` for [gRPC](../../../docs/serving/grpc.md). Grouped HTTP
-completions set `n` to the engine beam width and send a list of prompts.
+### Serve Hybrid Beam
+
+Build a persistent copy of the single-Trie table from the repository root.
+
+```bash
+python tools/constraints/build_constraint_table.py --model "$HYBRID_MODEL" \
+  --triples "$SID_TRIPLES" --output hybrid.safetensors --trust-remote-code
+```
+
+Save `hybrid.yaml` next to the artifact. Use the complete digests printed by
+the builder, including each `sha256:` prefix.
+
+```yaml
+trust-remote-code: true
+dtype: bfloat16
+attention-config:
+  backend: TRITON_MLA
+async-scheduling: true
+enable-prefix-caching: true
+enable-chunked-prefill: true
+mamba-cache-mode: align
+max-model-len: 2048
+max-num-batched-tokens: 4096
+max-num-seqs: 16
+gpu-memory-utilization: 0.65
+compilation-config:
+  cudagraph_mode: FULL_AND_PIECEWISE
+  cudagraph_capture_sizes: [4, 32, 128, 512, 1024, 2048, 4096]
+gr:
+  beam_graph_enabled: true
+  beam_batch_sizes: [1, 2]
+  prefill_token_buckets: [32, 128, 512, 1024, 2048, 4096]
+  beam_width: [8, 8, 8]
+  candidate_width: [8, 8, 8]
+  max_decode_steps: 3
+  constraint_mode: table
+  constraint_table:
+    format: constraint_table_v1
+    path: ./hybrid.safetensors
+    backend: cuda
+    max_top_k: 8
+    digests:
+      artifact: "<artifact_digest>"
+      tokenizer: "<tokenizer_digest>"
+```
+
+Enable [GR dispatch for the `vllm` CLI](../../../docs/cli/README.md#enable-gr-dispatch)
+in the active environment, then start the server.
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve "$HYBRID_MODEL" --gr --config hybrid.yaml
+```
+
+For [grouped HTTP completions](../../../docs/serving/completions.md#request),
+send a list of prompts with `use_beam_search=true` and `n=8`. Add `--grpc`
+to the server command for [gRPC token inputs](../../../docs/serving/grpc.md).
+See the [configuration reference](../../../docs/configuration/README.md) for
+YAML settings and CLI overrides.
 
 ## Beam Search V1
 
@@ -289,7 +350,7 @@ belong to `offline_beam_search.py`. Library defaults can differ.
 
 | Parameter | Example value | How the example sets it |
 | --- | --- | --- |
-| `beam_graph_enabled` | `true` on CUDA | On Ascend, `--execution graph` enables Beam graphs and `--execution eager` disables them. CUDA ignores this flag. |
+| `beam_graph_enabled` | `true` on CUDA | The CUDA Beam example sets the GR option to `true`. On Ascend, the script's `--execution` option selects `graph` or `eager`. |
 | `worker_decision` | `true` | The script enables Beam selection on the Worker. |
 | `beam_width` | `[128, 128, 128]` | `--beam-width` sets both the engine capacity and the request width. |
 | `max_decode_steps` | `3` | `--generated-steps` sets the effective token count. The three-layer Constraint Table requires `3`. |
@@ -551,7 +612,7 @@ On a configured Ascend server, run the opt-in public-API regression:
 ```bash
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
   python -m pytest --run-slow -s -v --tb=short \
-  tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
+  tests/e2e/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
 ```
 
 This test uses W=8, N=3 and a small catalog, loads eager, native-without-Beam-FULL
@@ -583,7 +644,7 @@ Run the strict padded comparison explicitly:
 VLLM_GR_TEST_MODEL=/path/to/OneRec_Qwen3_1.7B \
 VLLM_GR_TEST_PADDED_PREFILL=1 \
   python -m pytest --run-slow -s -v --tb=short \
-  tests/st/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
+  tests/e2e/test_onerec_v1_npu_e2e.py::test_onerec_v1_npu_graph_shape_switch
 ```
 
 The padded test sets `gr.prefill_token_buckets: [384]`.

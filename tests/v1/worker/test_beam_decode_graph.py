@@ -152,6 +152,8 @@ def capture_graph(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Mock, Mock]:
     graph.signature = shared.BeamDecodeGraphSignature(1, 4, 4)
     graph._bindings = {}
     graph._registries = {}
+    graph.cache_group_inputs = {}
+    graph.refused_group_shapes = set()
     graph.capture_inputs = None
     graph.capture_attention = None
     graph.descriptor = object()

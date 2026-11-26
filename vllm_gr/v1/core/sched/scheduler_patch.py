@@ -133,7 +133,7 @@ def apply_scheduler_patch():
         def has_requests(self):
             return original_has_requests(self) or has_gr_cleanup_work(self)
 
-        setattr(has_requests, "_gr_retirement_work", True)
+        has_requests._gr_retirement_work = True  # type: ignore[attr-defined]
         Scheduler.has_requests = has_requests
 
     if not getattr(Scheduler.add_request, "_vllm_gr_v1_add_request", False):
@@ -192,7 +192,7 @@ def apply_scheduler_patch():
                 return result
             return original_add_request(self, request)
 
-        setattr(patched_add_request, "_vllm_gr_v1_add_request", True)
+        patched_add_request._vllm_gr_v1_add_request = True  # type: ignore[attr-defined]
         Scheduler.add_request = patched_add_request
 
     if not getattr(Scheduler.finish_requests, "_vllm_gr_v1_finish_requests", False):
@@ -205,7 +205,7 @@ def apply_scheduler_patch():
             _sync_gr_sessions_after_native_finish(self, result, finished_status)
             return result
 
-        setattr(patched_finish_requests, "_vllm_gr_v1_finish_requests", True)
+        patched_finish_requests._vllm_gr_v1_finish_requests = True  # type: ignore[attr-defined]
         Scheduler.finish_requests = patched_finish_requests
 
     _patch_scheduler_reset_prefix_cache(Scheduler)
@@ -250,11 +250,12 @@ def apply_scheduler_patch():
 
         setattr(self, _GR_SCHEDULE_PATCH_DEPTH_ATTR, schedule_patch_depth + 1)
         try:
-            with gr_admission(self) as prefill_chunk:
+            with gr_admission(self) as checkpoint:
                 output = _original_schedule(self, throttle_prefills=throttle_prefills)
 
-            if prefill_chunk is not None:
-                attach_hybrid_prefill_chunk(self, output, prefill_chunk)
+            if checkpoint is not None:
+                owner, request_id = checkpoint
+                attach_hybrid_prefill_chunk(self, output, owner, request_id)
                 attach_gr_retirement(self, output)
                 return output
 
@@ -490,16 +491,16 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
     @wraps(_original_update)
     def patched_update_from_output(self, scheduler_output, model_runner_output, *args, **kwargs):
         from vllm_gr.v1.beam.dispatch import GR_STAGE_OUTPUT_ATTR
-        from vllm_gr.v1.core.sched.beam_async_scheduler import consume_gr_retirement
-        from vllm_gr.v1.core.sched.hybrid_prefill import (
-            HYBRID_PREFILL_ATTR,
+        from vllm_gr.v1.core.sched.beam_async_scheduler import (
             complete_hybrid_prefill_chunk,
+            consume_gr_retirement,
         )
+        from vllm_gr.v1.core.sched.hybrid_prefill import HYBRID_PREFILL_ATTR
 
         checkpoint = getattr(scheduler_output, HYBRID_PREFILL_ATTR, None)
         if checkpoint is not None:
             session = getattr(self, "_gr_v1_sessions", {}).get(checkpoint[0])
-            if session is None or session._hybrid_prefill_dispatch != checkpoint:
+            if session is None or session.hybrid_prefill_dispatch != checkpoint:
                 return {}
             result = _original_update(self, scheduler_output, model_runner_output, *args, **kwargs)
             complete_hybrid_prefill_chunk(self, session)
